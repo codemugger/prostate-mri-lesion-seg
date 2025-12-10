@@ -1,0 +1,92 @@
+dataset:
+  # For quick testing without predefined splits, set both CSVs to null and enable scan_all.
+  train_split_csv: null
+  val_split_csv: null
+  scan_all: true           # when true and CSVs are null/missing, scan directories and split internally
+  split_ratio: 0.8         # fraction for training; remainder used for validation
+  t2_dir: data/preprocessed/t2
+  label_dir: data/preprocessed/organ_masks
+  # Optional zone masks if you later choose to use them (not required for organ training)
+  pzone_dir: null
+  tzone_dir: null
+  cache_rate: 0.2
+  num_workers: 12
+
+preprocess:
+  spacing: [1.0, 1.0, 1.0]   # match inference operator spacing
+  roi_size: [128, 128, 16]   # matches app's sliding window ROI
+  samples_per_image: 2
+  pos_to_neg_ratio: 1.0      # balanced sampling around positives/negatives
+
+model:
+  # type can be: "unet" (MONAI UNet) or "rrunet3d" (training/rrunet.py)
+  type: rrunet3d
+  in_channels: 1              # keep 1 (T2-only) unless you add ADC/HIGHB to the dataset
+  out_channels: 3             # background=0, TZ=1, PZ=2 (multi-class organ segmentation)
+  # UNet-only (ignored by rrunet3d):
+  channels: [16, 32, 64, 128, 256]
+  strides: [2, 2, 2, 2]
+  num_res_units: 2
+  # RRUNet3D-only:
+  blocks_down: "2,2,3,3"
+  blocks_up: "3,3,2"
+  num_init_kernels: 48
+  recurrent: true
+  residual: true
+  attention: true
+  se: true
+
+train:
+  epochs: 200
+  batch_size: 2
+  lr: 0.0002
+  weight_decay: 0.0001
+  amp: true
+  seed: 42
+  grad_accum_steps: 1
+  log_interval: 10
+  val_interval: 1
+  deterministic: true
+
+loss:
+  type: dice_ce   # Dice + CrossEntropy
+  dice:
+    include_background: true
+    to_onehot_y: true
+    softmax: true
+  ce:
+    weight: null
+
+optimizer:
+  type: adamw
+
+scheduler:
+  type: cosine_anneal
+  t_max: 50
+  eta_min: 1.0e-6
+
+validation:
+  inferer_roi_size: [128, 128, 16]
+  inferer_sw_batch_size: 4
+  inferer_overlap: 0.5
+  # For organ segmentation, exclude background from dice calculation
+  # (focus on TZ and PZ segmentation quality)
+  include_background: false
+
+output:
+  exp_dir: experiments/organ
+  # Create a new subfolder per run: exp-001, exp-002, ...
+  per_run_subdir: true
+  # Enable TensorBoard logging
+  tensorboard: true
+  tb_subdir: tb
+  # Base names used for checkpoint files written inside the run subdir.
+  # The trainer will suffix these with epoch/exp/dice info.
+  best_checkpoint_name: best_model
+  last_checkpoint_name: last_model
+  metrics_csv: metrics.csv
+  # Save last checkpoint every N epochs (default: 1 = every epoch)
+  # Set to a higher value (e.g., 10) to save disk space, or set to epochs to only save at the end
+  save_last_interval: 10  # Save last checkpoint every 10 epochs (and always at final epoch)
+
+

@@ -1,0 +1,91 @@
+dataset:
+  # For quick testing without predefined splits, set both CSVs to null and enable scan_all.
+  train_split_csv: null
+  val_split_csv: null
+  scan_all: true           # when true and CSVs are null/missing, scan directories and split internally
+  split_ratio: 0.8         # fraction for training; remainder used for validation
+  t2_dir: data/preprocessed/t2
+  adc_dir: data/preprocessed/adc
+  highb_dir: data/preprocessed/highb
+  organ_mask_dir: data/preprocessed/organ_masks
+  lesion_mask_dir: data/preprocessed/lesion_masks
+  cache_rate: 0.2
+  num_workers: 4
+
+preprocess:
+  spacing: [0.5, 0.5, 0.5]   # 0.5mm isotropic spacing for lesion segmentation (matches inference)
+  roi_size: [128, 128, 16]   # patch size for training (matches inference sliding window)
+  roi_margin: 32              # margin around organ mask for ROI cropping (matches inference)
+  samples_per_image: 2        # number of random patches per image
+  pos_to_neg_ratio: 1.0       # balanced sampling around positives/negatives
+
+model:
+  # type can be: "unet" (MONAI UNet) or "rrunet3d" (training/rrunet.py)
+  type: rrunet3d
+  in_channels: 3              # T2, ADC, HIGHB (multi-parametric input)
+  out_channels: 2             # background=0, lesion=1 (binary lesion segmentation)
+  # UNet-only (ignored by rrunet3d):
+  channels: [16, 32, 64, 128, 256]
+  strides: [2, 2, 2, 2]
+  num_res_units: 2
+  # RRUNet3D-only:
+  blocks_down: "2,2,3,3"
+  blocks_up: "3,3,2"
+  num_init_kernels: 32
+  recurrent: true
+  residual: true
+  attention: true
+  se: true
+
+train:
+  epochs: 200
+  batch_size: 2
+  lr: 0.0002
+  weight_decay: 0.0001
+  amp: true
+  seed: 42
+  grad_accum_steps: 1
+  log_interval: 10
+  val_interval: 1
+  deterministic: true
+
+loss:
+  type: dice_ce   # Dice + CrossEntropy
+  dice:
+    include_background: false  # Focus on lesion class (class 1)
+    to_onehot_y: true
+    softmax: true
+  ce:
+    weight: null  # Can use [0.1, 0.9] to weight lesion class higher if needed
+
+optimizer:
+  type: adamw
+
+scheduler:
+  type: cosine_anneal
+  t_max: 50
+  eta_min: 1.0e-6
+
+validation:
+  inferer_roi_size: [128, 128, 16]
+  inferer_sw_batch_size: 4
+  inferer_overlap: 0.5
+  # For lesion segmentation, exclude background from dice calculation
+  # (focus on lesion detection quality)
+  include_background: false
+
+output:
+  exp_dir: experiments/lesion
+  # Create a new subfolder per run: exp-001, exp-002, ...
+  per_run_subdir: true
+  # Enable TensorBoard logging
+  tensorboard: true
+  tb_subdir: tb
+  # Base names used for checkpoint files written inside the run subdir.
+  # The trainer will suffix these with epoch/exp/dice info.
+  best_checkpoint_name: best_model
+  last_checkpoint_name: last_model
+  metrics_csv: metrics.csv
+  # Save last checkpoint every N epochs (default: 1 = every epoch)
+  # Set to a higher value (e.g., 10) to save disk space, or set to epochs to only save at the end
+  save_last_interval: 10  # Save last checkpoint every 10 epochs (and always at final epoch)
