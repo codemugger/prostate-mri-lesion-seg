@@ -1,0 +1,8 @@
+THIS IS THE PROSTATE MONAI APP (NVIDIA/NIH VERSION) BACKUP AS OF 10 DEC 2025 1010PM
+
+NOTE TO SELF:
+- Inference for APP works, but prostate segmentation remains only SINGLE CLASS (Whole prostate rather than multi-class) 
+- Validation inference for app completely works in the notebook directory, prostate segmentation is MULTI-CLASS (BG, TZ, PZ) 
+- RTSTRUCT workable for inference for APP ONLY 
+- Training for lesion pipeline created but not confirmed yet 
+- BATCH Inference for APP works 
