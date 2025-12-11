@@ -254,7 +254,7 @@ def train_organ_from_config(config_path: str) -> TrainArtifacts:
     )
     val_transforms = get_organ_val_transforms(spacing=cfg["preprocess"]["spacing"])
     # Reduce worker count for lesion training to avoid worker OOM/kill
-    worker_count = min(cfg["dataset"]["num_workers"], 4)
+    worker_count = max(cfg["dataset"]["num_workers"], 4)
 
     train_ds, val_ds = create_monai_datasets(
         train_items,
@@ -458,7 +458,7 @@ def train_lesion_from_config(config_path: str) -> TrainArtifacts:
         roi_size=cfg["preprocess"]["roi_size"],
     )
     
-    worker_count = min(cfg["dataset"]["num_workers"], 2)
+    worker_count = max(cfg["dataset"]["num_workers"], 4)
 
     train_ds, val_ds = create_monai_datasets(
         train_items,
@@ -469,7 +469,8 @@ def train_lesion_from_config(config_path: str) -> TrainArtifacts:
         num_workers=worker_count,
     )
     # Use pad_list_data_collate for lesion training because CropROIFromOrganMask produces variable-sized outputs
-    # that need to be padded before batching (RandSpatialCropSamplesd returns fixed-size crops, but from variable inputs)
+    # that need to be padded before 
+    # ing (RandSpatialCropSamplesd returns fixed-size crops, but from variable inputs)
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg["train"]["batch_size"],
