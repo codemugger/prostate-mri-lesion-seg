@@ -1,4 +1,4 @@
-THIS IS THE PROSTATE MONAI APP (NVIDIA/NIH VERSION) AFTER 10 DEC 2025 1010PM
+THIS IS THE PROSTATE MONAI APP (NVIDIA/NIH VERSION) 11 DEC 2025 0946H:
 
 NOTE TO SELF FOR 10 DEC 2025 AND BEFORE:
 - Inference for APP works, but prostate segmentation remains only SINGLE CLASS (Whole prostate rather than multi-class) 
@@ -7,5 +7,7 @@ NOTE TO SELF FOR 10 DEC 2025 AND BEFORE:
 - Training for lesion pipeline created but not confirmed yet 
 - BATCH Inference for APP works 
 
-NOTE TO SELF AFTER 10 DEC 2025:
-- We gonna try to fix the app to produce multi-class and also do lesion training 
+NOTE TO SELF AFTER 11 DEC 0946H:
+- App now successfully generates MULTI-CLASS Prostate Segmentation, showing the P-TZONE and T-ZONE 
+- README has been updated to reflect the latest pipelines and app features
+- Pending 
