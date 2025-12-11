@@ -265,13 +265,13 @@ def generate_rtstruct_files(
             rtstruct = RTStructBuilder.create_new(dicom_series_path=str(t2_dicom_series_path))
 
             # Whole prostate (union of TZ+PZ) – keeps backward-compatible organ concept.
-            if whole_mask.any():
-                rtstruct.add_roi(
-                    mask=whole_mask,
-                    name="Prostate_Organ",
-                    color=[0, 255, 0],  # Green
-                    use_pin_hole=True,
-                )
+            # if whole_mask.any():
+            #     rtstruct.add_roi(
+            #         mask=whole_mask,
+            #         name="Prostate_Organ",
+            #         color=[0, 255, 0],  # Green
+            #         use_pin_hole=True,
+            #     )
 
             # Transition Zone (TZ)
             if tz_mask.any():
