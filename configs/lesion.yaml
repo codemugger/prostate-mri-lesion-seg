@@ -10,7 +10,7 @@ dataset:
   organ_mask_dir: data/preprocessed/organ_masks
   lesion_mask_dir: data/preprocessed/lesion_masks
   cache_rate: 0.2
-  num_workers: 4
+  num_workers: 8
 
 preprocess:
   spacing: [0.5, 0.5, 0.5]   # 0.5mm isotropic spacing for lesion segmentation (matches inference)
@@ -31,7 +31,7 @@ model:
   # RRUNet3D-only:
   blocks_down: "2,2,3,3"
   blocks_up: "3,3,2"
-  num_init_kernels: 32
+  num_init_kernels: 16
   recurrent: true
   residual: true
   attention: true
@@ -39,7 +39,7 @@ model:
 
 train:
   epochs: 200
-  batch_size: 2
+  batch_size: 1
   lr: 0.0002
   weight_decay: 0.0001
   amp: true
