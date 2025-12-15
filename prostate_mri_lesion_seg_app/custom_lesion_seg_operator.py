@@ -255,16 +255,30 @@ class ProstateLesionSegOperator(Operator):
         print("\nBeginning lesion segmentation...")
 
         # Instantiate network and send to GPU
-        nets = [
-            RRUNet3D(
+        # nets = [
+        #     RRUNet3D(
+        #     in_channels=3,
+        #     out_channels=2,
+        #     blocks_down="1,2,3,4",
+        #     blocks_up="3,2,1",
+        #     num_init_kernels=32,
+        #     recurrent=False,
+        #     residual=True,
+        #     attention=False,
+        #     debug=False,
+        #     )
+        #     for _ in range(5)
+        # ]
+        nets = [RRUNet3D(
             in_channels=3,
             out_channels=2,
-            blocks_down="1,2,3,4",
-            blocks_up="3,2,1",
+            blocks_down="2,2,3,3",
+            blocks_up="3,3,2",
             num_init_kernels=32,
-            recurrent=False,
+            recurrent=True,
             residual=True,
-            attention=False,
+            attention=True,
+            se=True,
             debug=False,
             )
             for _ in range(5)

@@ -19,6 +19,7 @@ from monai.transforms import (
     EnsureTyped,
     AsDiscreted,
     RandSpatialCropSamplesd,
+    RandCropByPosNegLabeld,
     Resized,
     MapTransform,
 )
@@ -650,13 +651,23 @@ def get_lesion_train_transforms(
             SpatialPadd(keys=["image", "label"], spatial_size=roi_size, mode="constant"),
             # Multi-channel normalization
             MultiChannelNormalize(keys=["image"], nonzero=True),
-            # Random spatial cropping
-            RandSpatialCropSamplesd(
+            # Random crop by pos/neg label
+            RandCropByPosNegLabeld(
                 keys=["image", "label"],
-                roi_size=roi_size,
+                label_key="label",
+                spatial_size=roi_size,
                 num_samples=samples_per_image,
-                random_size=False,
+                pos=pos_to_neg,  # e.g., 4.0
+                neg=1,
+                image_key="image",
             ),
+            # # Random spatial cropping
+            # RandSpatialCropSamplesd(
+            #     keys=["image", "label"],
+            #     roi_size=roi_size,
+            #     num_samples=samples_per_image,
+            #     random_size=False,
+            # ),
             # Augmentations
             RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
             RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
