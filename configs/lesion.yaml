@@ -10,14 +10,14 @@ dataset:
   organ_mask_dir: data/preprocessed/organ_masks
   lesion_mask_dir: data/preprocessed/lesion_masks
   cache_rate: 0.2
-  num_workers: 8
+  num_workers: 4
 
 preprocess:
   spacing: [0.5, 0.5, 0.5]   # 0.5mm isotropic spacing for lesion segmentation (matches inference)
-  roi_size: [128, 128, 16]   # patch size for training (matches inference sliding window)
-  roi_margin: 32              # margin around organ mask for ROI cropping (matches inference)
-  samples_per_image: 2        # number of random patches per image
-  pos_to_neg_ratio: 1.0       # balanced sampling around positives/negatives
+  roi_size: [96, 96, 16]   # patch size for training (matches inference sliding window)
+  roi_margin: 32             # margin around organ mask for ROI cropping (matches inference)
+  samples_per_image: 4     # number of random patches per image
+  pos_to_neg_ratio: 3    # balanced sampling around positives/negatives
 
 model:
   # type can be: "unet" (MONAI UNet) or "rrunet3d" (training/rrunet.py)
@@ -29,18 +29,18 @@ model:
   strides: [2, 2, 2, 2]
   num_res_units: 2
   # RRUNet3D-only:
-  blocks_down: "2,2,3,3"
-  blocks_up: "3,3,2"
-  num_init_kernels: 16
-  recurrent: true
+  blocks_down: "1,2,3,4"
+  blocks_up: "3,2,1"
+  num_init_kernels: 32
+  recurrent: false
   residual: true
-  attention: true
-  se: true
+  attention: false
+  se: false
 
 train:
-  epochs: 200
+  epochs: 20
   batch_size: 1
-  lr: 0.0002
+  lr: 0.0003
   weight_decay: 0.0001
   amp: true
   seed: 42
@@ -56,7 +56,7 @@ loss:
     to_onehot_y: true
     softmax: true
   ce:
-    weight: null  # Can use [0.1, 0.9] to weight lesion class higher if needed
+    weight: [0.1,0.9]  # Can use [0.1, 0.9] to weight lesion class higher if needed
 
 optimizer:
   type: adamw
