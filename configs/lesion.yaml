@@ -17,7 +17,66 @@ preprocess:
   roi_size: [96, 96, 16]   # patch size for training (matches inference sliding window)
   roi_margin: 32             # margin around organ mask for ROI cropping (matches inference)
   samples_per_image: 4     # number of random patches per image
-  pos_to_neg_ratio: 3    # balanced sampling around positives/negatives
+  pos_to_neg_ratio: 2.5    # balanced sampling around positives/negatives
+
+augment:
+  prob: 0.15
+  enable:
+    elastic: true
+    zoom: true
+    rotate90: true
+    bias_field: true
+    gaussian_smooth: true
+    gibbs_noise: true
+    gaussian_noise: true
+    shift_intensity: true
+    sharpen: false
+    adjust_contrast: false
+  elastic:
+    sigma_range: [0.5, 1.5]
+    magnitude_range: [0.5, 1.0]
+    rotate_range: [0.05, 0.05, 0.05]
+    translate_range: [2, 2, 0]
+    scale_range: [0.05, 0.05, 0.0]
+    prob: 0.15
+  zoom:
+    min_zoom: 0.9
+    max_zoom: 1.1
+    prob: 0.15
+  rotate90:
+    prob: 0.15
+    max_k: 3
+  bias_field:
+    coeff_range: [0.0, 0.01]
+    degree: 3
+    prob: 0.15
+  gaussian_smooth:
+    sigma_x: [0.25, 1.0]
+    sigma_y: [0.25, 1.0]
+    sigma_z: [0.25, 1.0]
+    prob: 0.15
+  gibbs_noise:
+    alpha: [0.5, 1.0]
+    prob: 0.15
+  gaussian_noise:
+    mean: 0.0
+    std: 0.05
+    prob: 0.15
+  shift_intensity:
+    offsets: 0.1
+    prob: 0.15
+  sharpen:
+    sigma1_x: [0.5, 1.0]
+    sigma1_y: [0.5, 1.0]
+    sigma1_z: [0.5, 1.0]
+    sigma2_x: [0.5, 1.0]
+    sigma2_y: [0.5, 1.0]
+    sigma2_z: [0.5, 1.0]
+    alpha: [10.0, 20.0]
+    prob: 0.1
+  adjust_contrast:
+    gamma: [0.7, 1.3]
+    prob: 0.1
 
 model:
   # type can be: "unet" (MONAI UNet) or "rrunet3d" (training/rrunet.py)
@@ -38,7 +97,7 @@ model:
   se: false
 
 train:
-  epochs: 20
+  epochs: 60
   batch_size: 1
   lr: 0.0003
   weight_decay: 0.0001
@@ -50,20 +109,21 @@ train:
   deterministic: true
 
 loss:
-  type: dice_ce   # Dice + CrossEntropy
+  type: dice_focal   # Dice + Focal for imbalance
   dice:
     include_background: false  # Focus on lesion class (class 1)
     to_onehot_y: true
     softmax: true
-  ce:
-    weight: [0.1,0.9]  # Can use [0.1, 0.9] to weight lesion class higher if needed
+  focal:
+    gamma: 2.0
+    alpha: 0.75
 
 optimizer:
   type: adamw
 
 scheduler:
   type: cosine_anneal
-  t_max: 50
+  t_max: 60
   eta_min: 1.0e-6
 
 validation:

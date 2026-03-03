@@ -1,0 +1,68 @@
+case_id,series_description,image_type,Series type
+ProstateX-0000,tfl_dyn_fast_tra_1.5x1.5_t3.5sec,"['ORIGINAL', 'PRIMARY', 'M', 'DIS2D']",ignore
+ProstateX-0000,t2_tse_sag,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D']",ignore
+ProstateX-0000,ep2d_diff_tra_DYNDIST_ADC,"['DERIVED', 'PRIMARY', 'DIFFUSION', 'ADC', 'DIS2D']",adc
+ProstateX-0000,t2_tse_cor,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D']",ignore
+ProstateX-0000,ep2d_diff_tra_DYNDIST,"['DERIVED', 'PRIMARY', 'DIFFUSION', 'TRACEW', 'DIS2D']",dwi?
+ProstateX-0001,ep2d_diff_tra_DYNDIST_MIX_ADC,"['DERIVED', 'PRIMARY', 'DIFFUSION', 'ADC', 'DIS2D']",adc
+ProstateX-0000,ep2d_diff_tra_DYNDISTCALC_BVAL,"['DERIVED', 'PRIMARY', 'DIFFUSION', 'TRACEW', 'DIS2D']",dwi?
+ProstateX-0000,tfl_3d PD ref_tra_1.5x1.5_t3,"['ORIGINAL', 'PRIMARY', 'M', 'DIS2D']",ignore
+ProstateX-0001,t2_localizer,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D']",ignore
+sgh_data_patient_1,ddep2d_diff_ADC,"['ORIGINAL', 'PRIMARY', 'ADC_UNSPECIFIED', 'ADC', 'UNSPECIFIED']",adc
+ProstateX-0001,tfl_3d PD ref_tra_1.5x1.5_t3,"['ORIGINAL', 'PRIMARY', 'M', 'DIS2D']",ignore
+ProstateX-0001,tfl_dyn_fast_tra_1.5x1.5_t3.5sec,"['ORIGINAL', 'PRIMARY', 'M', 'DIS2D']",ignore
+ProstateX-0001,t2_loc sag,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D']",ignore
+ProstateX-0001,t2_tse_sag,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D']",ignore
+ProstateX-0001,t2_tse_cor,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D']",ignore
+ProstateX-0001,ep2d_diff_tra_DYNDIST_MIX,"['DERIVED', 'PRIMARY', 'DIFFUSION', 'TRACEW', 'DIS2D']",dwi?
+sgh_data_patient_2,AX DWI_diff_b50- b500-b1000-b1800_ADC,"['DERIVED', 'PRIMARY', 'DIFFUSION', 'ADC', 'DIS2D']",adc
+ProstateX-0001,ep2d_diff_tra_DYNDIST_MIXCALC_BVAL,"['DERIVED', 'PRIMARY', 'DIFFUSION', 'TRACEW', 'DIS2D']",dwi?
+sgh_data_patient_3,ep2d_diff_zoomit_b50_500_1000_1800_tra_ADC,"['DERIVED', 'PRIMARY', 'DIFFUSION', 'ADC', 'NORM', 'DIS2D', 'DFC', 'MIX', 'MFSPLIT']",adc
+ProstateX-0004,ep2d_diff_tra_DYNDIST_MIX_ADC,"['DERIVED', 'PRIMARY', 'DIFFUSION', 'ADC', 'DIS2D']",adc
+sgh_data_patient_1,SURVEY,"['ORIGINAL', 'PRIMARY', 'M_FFE', 'M', 'FFE']",ignore
+sgh_data_patient_1,et2_tse_tra obl,"['ORIGINAL', 'PRIMARY', 'M_SE', 'M', 'SE']",ignore
+sgh_data_patient_1,eTHRIVE+c wholepelvis,"['ORIGINAL', 'PRIMARY', 'M_FFE', 'M', 'FFE']",ignore
+sgh_data_patient_1,et2_tse_tra_sfs_whole_pelvis,"['ORIGINAL', 'PRIMARY', 'M_SE', 'M', 'SE']",ignore
+sgh_data_patient_1,et1_tse_tra_whole_pelvis,"['ORIGINAL', 'PRIMARY', 'M_SE', 'M', 'SE']",ignore
+sgh_data_patient_1,et2_tse_sag_multivane,"['ORIGINAL', 'PRIMARY', 'M_SE', 'M', 'SE']",ignore
+sgh_data_patient_1,et2_tse_cor,"['ORIGINAL', 'PRIMARY', 'M_SE', 'M', 'SE']",ignore
+sgh_data_patient_4,dReg - dwi_zoom_b0_500_1000_ADC,"['ORIGINAL', 'PRIMARY', 'ADC_UNSPECIFIED', 'ADC', 'UNSPECIFIED']",adc
+sgh_data_patient_1,et1_tse_tra,"['ORIGINAL', 'PRIMARY', 'M_SE', 'M', 'SE']",ignore
+sgh_data_patient_2,AX_t1_tse,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D']",ignore
+sgh_data_patient_2,AX_T1_vibe_Whole Pelvis POST CONTRAST_W,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'WATER', 'DIS2D']",ignore
+sgh_data_patient_2,AX_t1_tse whole pelvis,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D']",ignore
+sgh_data_patient_2,SAG_t2_tse,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D']",ignore
+sgh_data_patient_2,AX_T2 FS whole pelvis,"['ORIGINAL', 'PRIMARY', 'M', 'ND', 'NORM']",ignore
+sgh_data_patient_1,dep2d_diff_3scan_trace_RL,"['ORIGINAL', 'PRIMARY', 'M_SE', 'M', 'SE']",dwi
+sgh_data_patient_2,AX DWI_diff_b50- b500-b1000-b1800_TRACEW,"['DERIVED', 'PRIMARY', 'DIFFUSION', 'TRACEW', 'DIS2D']",dwi
+sgh_data_patient_3,ep2d_diff_zoomit_b50_500_1000_1800_tra_TRACEW,"['DERIVED', 'PRIMARY', 'DIFFUSION', 'TRACEW', 'NORM', 'DIS2D', 'DFC', 'MIX', 'MFSPLIT']",dwi
+sgh_data_patient_4,dwi_zoom_b0_500_1000,"['ORIGINAL', 'PRIMARY', 'M_SE', 'M', 'SE']",dwi
+sgh_data_patient_3,t2_tse_tra_obl_fast-blade,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D', 'MFSPLIT']",ignore
+sgh_data_patient_3,t2_tse_sag_fast-blade,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D', 'MFSPLIT']",ignore
+sgh_data_patient_3,localizer,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D', 'MFSPLIT']",ignore
+sgh_data_patient_3,t2_tse_tra_fs_whole_pelvis p4,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D', 'MFSPLIT']",ignore
+sgh_data_patient_3,t1_tse_tra_whole_pelvis p4,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D', 'MFSPLIT']",ignore
+sgh_data_patient_3,t2_tse_cor_fast-blade,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D', 'MFSPLIT']",ignore
+sgh_data_patient_4,dwi_zoom_b1800,"['ORIGINAL', 'PRIMARY', 'M_SE', 'M', 'SE']",dwi
+sgh_data_patient_3,t1_tse_tra p2,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D', 'MFSPLIT']",ignore
+ProstateX-0000,t2_tse_tra,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D']",t2w
+ProstateX-0004,t2_tse_sag,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D']",ignore
+ProstateX-0004,t2_tse_cor,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D']",ignore
+ProstateX-0001,t2_tse_tra,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D']",t2w
+ProstateX-0004,ep2d_diff_tra_DYNDIST_MIX,"['DERIVED', 'PRIMARY', 'DIFFUSION', 'TRACEW', 'DIS2D']",dwi?
+sgh_data_patient_1,et2_tse_tra,"['ORIGINAL', 'PRIMARY', 'M_SE', 'M', 'SE']",t2w
+ProstateX-0004,ep2d_diff_tra_DYNDIST_MIXCALC_BVAL,"['DERIVED', 'PRIMARY', 'DIFFUSION', 'TRACEW', 'DIS2D']",dwi?
+ProstateX-0004,tfl_3d PD ref_tra_1.5x1.5_t3,"['ORIGINAL', 'PRIMARY', 'M', 'DIS2D']",ignore
+sgh_data_patient_4,eet2_tse_tra_obl,"['ORIGINAL', 'PRIMARY', 'M_SE', 'M', 'SE']",ignore
+sgh_data_patient_2,AX_t2_tse,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D']",t2w
+sgh_data_patient_3,t2_tse_tra_fast-blade,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D', 'MFSPLIT']",t2w
+ProstateX-0004,t2_tse_tra,"['ORIGINAL', 'PRIMARY', 'M', 'NORM', 'DIS2D']",t2w
+sgh_data_patient_4,ee-THRIVE_tra_fs,"['ORIGINAL', 'PRIMARY', 'M_FFE', 'M', 'FFE']",ignore
+sgh_data_patient_4,e-THRIVE_tra_fs+c_wholepelvis,"['ORIGINAL', 'PRIMARY', 'M_FFE', 'M', 'FFE']",ignore
+sgh_data_patient_4,SURVEY_BFFE,"['ORIGINAL', 'PRIMARY', 'M_FFE', 'M', 'FFE']",ignore
+sgh_data_patient_4,t2_tse_tra_pelvis_fs,"['ORIGINAL', 'PRIMARY', 'M_SE', 'M', 'SE']",ignore
+sgh_data_patient_4,t1_tra_tra_pelvis,"['ORIGINAL', 'PRIMARY', 'M_SE', 'M', 'SE']",ignore
+sgh_data_patient_4,et2_tse_cor,"['ORIGINAL', 'PRIMARY', 'M_SE', 'M', 'SE']",ignore
+sgh_data_patient_4,et2_tse_sag,"['ORIGINAL', 'PRIMARY', 'M_SE', 'M', 'SE']",ignore
+sgh_data_patient_4,et2_tse_tra,"['ORIGINAL', 'PRIMARY', 'M_SE', 'M', 'SE']",t2w
+sgh_data_patient_4,et1_tse_tra,"['ORIGINAL', 'PRIMARY', 'M_SE', 'M', 'SE']",ignore

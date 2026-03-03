@@ -10,7 +10,7 @@ from monai.data import list_data_collate, pad_list_data_collate
 from monai.metrics import DiceMetric
 from monai.networks.nets import UNet
 from monai.inferers import SlidingWindowInferer
-from monai.transforms import AsDiscrete, KeepLargestConnectedComponent
+from monai.transforms import AsDiscrete
 from monai.utils import set_determinism
 
 from .datasets import (
@@ -142,7 +142,6 @@ def validate(model, loader, device, inferer, post_pred, post_label, include_back
     dice_metric = DiceMetric(include_background=include_background, reduction="mean_batch")
     batch_count = 0
     
-    lcc = KeepLargestConnectedComponent(applied_labels=[1])
     with torch.no_grad():
         for batch in loader:
             images = batch["image"].to(device)
@@ -165,23 +164,8 @@ def validate(model, loader, device, inferer, post_pred, post_label, include_back
             
             logits = inferer(inputs=images, network=model)
             preds = post_pred(logits)
-            preds = lcc(preds)
             labs = post_label(labels)
             
-            # Skip true-negative batches (both GT and pred are empty / background only)
-            pred_argmax = preds.argmax(dim=1)  # [B,H,W,D]
-            lab_argmax = labs.argmax(dim=1)    # [B,H,W,D]
-            pred_has_fg = (pred_argmax != 0).any(dim=(1, 2, 3))
-            lab_has_fg = (lab_argmax != 0).any(dim=(1, 2, 3))
-            keep_mask = (pred_has_fg | lab_has_fg)
-            if not keep_mask.any():
-                batch_count += 1
-                continue  # both empty → skip this batch
-            # If mixed, keep only items that have foreground in either GT or pred
-            if (~keep_mask).any():
-                preds = preds[keep_mask]
-                labs = labs[keep_mask]
-
             # Debug: Check predictions and one-hot labels (first 3 batches)
             if batch_count < 3:
                 # print(f"  [DEBUG] Batch {batch_count} - Logits shape: {tuple(logits.shape)}")
@@ -467,7 +451,6 @@ def train_lesion_from_config(config_path: str) -> TrainArtifacts:
         roi_margin=cfg["preprocess"]["roi_margin"],
         samples_per_image=cfg["preprocess"]["samples_per_image"],
         pos_to_neg=cfg["preprocess"]["pos_to_neg_ratio"],
-        augment=cfg.get("augment", {}),
     )
     val_transforms = get_lesion_val_transforms(
         spacing=cfg["preprocess"]["spacing"],

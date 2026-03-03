@@ -4,7 +4,6 @@ from typing import Sequence, Dict, Any
 import numpy as np
 import nibabel as nib
 from skimage.transform import resize
-
 from monai.transforms import (
     Compose,
     LoadImaged,
@@ -16,6 +15,16 @@ from monai.transforms import (
     RandFlipd,
     RandAffined,
     RandGaussianNoised,
+    Rand3DElasticd,
+    RandZoomd,
+    RandRotate90d,
+    RandBiasFieldd,
+    RandGaussianSmoothd,
+    RandGibbsNoised,
+    RandGaussianNoised,
+    RandShiftIntensityd,
+    RandGaussianSharpend,
+    RandAdjustContrastd,
     EnsureTyped,
     AsDiscreted,
     RandSpatialCropSamplesd,
@@ -604,6 +613,7 @@ def get_lesion_train_transforms(
     roi_margin: int,
     samples_per_image: int,
     pos_to_neg: float,
+    augment: Dict[str, Any] | None = None,
 ):
     """
     Training transforms for binary lesion segmentation (background=0, lesion=1).
@@ -613,8 +623,25 @@ def get_lesion_train_transforms(
     - Multi-channel normalization
     - Random spatial cropping and augmentations
     """
-    return Compose(
-        [
+    aug = augment or {}
+    aug_prob = float(aug.get("prob", 0.15))
+    enable = aug.get("enable", {})
+
+    def enabled(name: str, default: bool = True) -> bool:
+        return bool(enable.get(name, default))
+
+    elastic_cfg = aug.get("elastic", {})
+    zoom_cfg = aug.get("zoom", {})
+    rot90_cfg = aug.get("rotate90", {})
+    bias_cfg = aug.get("bias_field", {})
+    gsmooth_cfg = aug.get("gaussian_smooth", {})
+    gibbs_cfg = aug.get("gibbs_noise", {})
+    gnoise_cfg = aug.get("gaussian_noise", {})
+    shift_cfg = aug.get("shift_intensity", {})
+    sharpen_cfg = aug.get("sharpen", {})
+    contrast_cfg = aug.get("adjust_contrast", {})
+
+    tfms = [
             DropNoneKeys(keys=["label"]),
             LoadImaged(keys=["t2", "organ_mask"]),
             LoadImaged(keys=["label"], allow_missing_keys=True),  # Lesion mask is optional
@@ -651,24 +678,122 @@ def get_lesion_train_transforms(
             SpatialPadd(keys=["image", "label"], spatial_size=roi_size, mode="constant"),
             # Multi-channel normalization
             MultiChannelNormalize(keys=["image"], nonzero=True),
-            # Random crop by pos/neg label
-            RandCropByPosNegLabeld(
+    ]
+
+    # Geometric augs
+    if enabled("elastic"):
+        tfms.append(
+            Rand3DElasticd(
                 keys=["image", "label"],
-                label_key="label",
-                spatial_size=roi_size,
-                num_samples=samples_per_image,
-                pos=pos_to_neg,  # e.g., 4.0
-                neg=1,
-                image_key="image",
-            ),
-            # # Random spatial cropping
-            # RandSpatialCropSamplesd(
-            #     keys=["image", "label"],
-            #     roi_size=roi_size,
-            #     num_samples=samples_per_image,
-            #     random_size=False,
-            # ),
-            # Augmentations
+                sigma_range=tuple(elastic_cfg.get("sigma_range", (0.5, 1.5))),
+                magnitude_range=tuple(elastic_cfg.get("magnitude_range", (0.5, 1.0))),
+                rotate_range=tuple(elastic_cfg.get("rotate_range", (0.05, 0.05, 0.05))),
+                translate_range=tuple(elastic_cfg.get("translate_range", (2, 2, 0))),
+                scale_range=tuple(elastic_cfg.get("scale_range", (0.05, 0.05, 0.0))),
+                mode=("bilinear", "nearest"),
+                prob=float(elastic_cfg.get("prob", aug_prob)),
+            )
+        )
+    if enabled("zoom"):
+        tfms.append(
+            RandZoomd(
+                keys=["image", "label"],
+                min_zoom=float(zoom_cfg.get("min_zoom", 0.9)),
+                max_zoom=float(zoom_cfg.get("max_zoom", 1.1)),
+                mode=("bilinear", "nearest"),
+                prob=float(zoom_cfg.get("prob", aug_prob)),
+            )
+        )
+    if enabled("rotate90"):
+        tfms.append(
+            RandRotate90d(
+                keys=["image", "label"],
+                prob=float(rot90_cfg.get("prob", aug_prob)),
+                max_k=int(rot90_cfg.get("max_k", 3)),
+            )
+        )
+
+    # Spatial crops (robust to empty lesions)
+    tfms.append(
+        RandSpatialCropSamplesd(
+            keys=["image", "label"],
+            roi_size=roi_size,
+            num_samples=samples_per_image,
+            random_size=False,
+        )
+    )
+
+    # Intensity augs (images only)
+    if enabled("bias_field"):
+        tfms.append(
+            RandBiasFieldd(
+                keys=["image"],
+                prob=float(bias_cfg.get("prob", aug_prob)),
+                coeff_range=tuple(bias_cfg.get("coeff_range", (0.0, 0.01))),
+                degree=int(bias_cfg.get("degree", 3)),
+            )
+        )
+    if enabled("gaussian_smooth"):
+        tfms.append(
+            RandGaussianSmoothd(
+                keys=["image"],
+                prob=float(gsmooth_cfg.get("prob", aug_prob)),
+                sigma_x=tuple(gsmooth_cfg.get("sigma_x", (0.25, 1.0))),
+                sigma_y=tuple(gsmooth_cfg.get("sigma_y", (0.25, 1.0))),
+                sigma_z=tuple(gsmooth_cfg.get("sigma_z", (0.25, 1.0))),
+            )
+        )
+    if enabled("gibbs_noise"):
+        tfms.append(
+            RandGibbsNoised(
+                keys=["image"],
+                prob=float(gibbs_cfg.get("prob", aug_prob)),
+                alpha=tuple(gibbs_cfg.get("alpha", (0.5, 1.0))),
+            )
+        )
+    if enabled("gaussian_noise"):
+        tfms.append(
+            RandGaussianNoised(
+                keys=["image"],
+                prob=float(gnoise_cfg.get("prob", aug_prob)),
+                mean=float(gnoise_cfg.get("mean", 0.0)),
+                std=float(gnoise_cfg.get("std", 0.05)),
+            )
+        )
+    if enabled("shift_intensity"):
+        tfms.append(
+            RandShiftIntensityd(
+                keys=["image"],
+                prob=float(shift_cfg.get("prob", aug_prob)),
+                offsets=float(shift_cfg.get("offsets", 0.1)),
+            )
+        )
+    if enabled("sharpen"):
+        tfms.append(
+            RandGaussianSharpend(
+                keys=["image"],
+                prob=float(sharpen_cfg.get("prob", 0.1)),
+                sigma1_x=tuple(sharpen_cfg.get("sigma1_x", (0.5, 1.0))),
+                sigma1_y=tuple(sharpen_cfg.get("sigma1_y", (0.5, 1.0))),
+                sigma1_z=tuple(sharpen_cfg.get("sigma1_z", (0.5, 1.0))),
+                sigma2_x=tuple(sharpen_cfg.get("sigma2_x", (0.5, 1.0))),
+                sigma2_y=tuple(sharpen_cfg.get("sigma2_y", (0.5, 1.0))),
+                sigma2_z=tuple(sharpen_cfg.get("sigma2_z", (0.5, 1.0))),
+                alpha=tuple(sharpen_cfg.get("alpha", (10.0, 20.0))),
+            )
+        )
+    if enabled("adjust_contrast"):
+        tfms.append(
+            RandAdjustContrastd(
+                keys=["image"],
+                prob=float(contrast_cfg.get("prob", 0.1)),
+                gamma=tuple(contrast_cfg.get("gamma", (0.7, 1.3))),
+            )
+        )
+
+    # Flips / small affine
+    tfms.extend(
+        [
             RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
             RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
             RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
@@ -679,10 +804,11 @@ def get_lesion_train_transforms(
                 scale_range=(0.1, 0.1, 0.0),
                 mode=("bilinear", "nearest"),
             ),
-            RandGaussianNoised(keys=["image"], prob=0.1, mean=0.0, std=0.05),
             EnsureTyped(keys=["image", "label"]),
         ]
     )
+
+    return Compose(tfms)
 
 
 def get_lesion_val_transforms(

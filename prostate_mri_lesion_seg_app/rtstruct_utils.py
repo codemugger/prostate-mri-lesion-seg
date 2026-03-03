@@ -55,6 +55,7 @@ redistributes the SOFTWARE, a copy of this Agreement must be included with
 each copy of the SOFTWARE.'''
 
 import os
+import tempfile
 import logging
 import numpy as np
 import nibabel as nib
@@ -69,6 +70,57 @@ except ImportError as exc:  # pragma: no cover - runtime dependency
     raise ImportError(
         "rt_utils package is required. Install it with: pip install rt-utils"
     ) from exc
+
+
+def _ensure_study_id(dicom_series_path: str) -> tuple[str, Optional[tempfile.TemporaryDirectory]]:
+    """
+    Ensure every DICOM file in *dicom_series_path* has the StudyID tag
+    (0020,0010).  SGH de-identified data is missing this tag, which causes
+    rt_utils / pydicom to crash during RTSTRUCT creation.
+
+    If all files already have StudyID, the original path is returned unchanged.
+    Otherwise a temporary copy is made with StudyID populated from
+    AccessionNumber (0008,0050) -- matching the expected de-id behaviour.
+
+    Returns (path_to_use, tmpdir_handle).  The caller must keep *tmpdir_handle*
+    alive until RTSTRUCT generation is complete; it is ``None`` when no
+    patching was required.
+    """
+    import pydicom
+
+    dcm_files = [
+        os.path.join(dicom_series_path, f)
+        for f in os.listdir(dicom_series_path)
+        if f.lower().endswith(".dcm")
+    ]
+    if not dcm_files:
+        return dicom_series_path, None
+
+    needs_patch = False
+    for fp in dcm_files:
+        ds = pydicom.dcmread(fp, stop_before_pixels=True, force=True)
+        if (0x0020, 0x0010) not in ds:
+            needs_patch = True
+            break
+
+    if not needs_patch:
+        return dicom_series_path, None
+
+    tmpdir = tempfile.TemporaryDirectory(prefix="rtstruct_patched_")
+    patched_count = 0
+    for fp in dcm_files:
+        ds = pydicom.dcmread(fp, force=True)
+        if (0x0020, 0x0010) not in ds:
+            accession = getattr(ds, "AccessionNumber", "") or ""
+            ds.StudyID = accession[:16]  # VR=SH, max 16 chars
+            patched_count += 1
+        ds.save_as(os.path.join(tmpdir.name, os.path.basename(fp)))
+
+    logging.info(
+        "Patched StudyID (from AccessionNumber) on %d/%d DICOM files in temp dir: %s",
+        patched_count, len(dcm_files), tmpdir.name,
+    )
+    return tmpdir.name, tmpdir
 
 
 def _prepare_mask_from_array(label_data: np.ndarray) -> np.ndarray:
@@ -194,22 +246,24 @@ def create_rtstruct_from_mask(
     if not os.path.exists(dicom_series_path):
         raise FileNotFoundError(f"DICOM series path not found: {dicom_series_path}")
 
-    # Reference DICOM T2 series
-    rtstruct = RTStructBuilder.create_new(dicom_series_path=dicom_series_path)
+    patched_path, tmpdir = _ensure_study_id(dicom_series_path)
+    try:
+        rtstruct = RTStructBuilder.create_new(dicom_series_path=patched_path)
 
-    # Load segmentation (boolean, (z,y,x))
-    numpy_segmentation_mask = load_nifti_mask(nifti_mask_path)
+        numpy_segmentation_mask = load_nifti_mask(nifti_mask_path)
 
-    # Add as ROI
-    rtstruct.add_roi(
-        mask=numpy_segmentation_mask,
-        name=roi_name,
-        color=roi_color,
-        use_pin_hole=use_pin_hole,
-    )
+        rtstruct.add_roi(
+            mask=numpy_segmentation_mask,
+            name=roi_name,
+            color=roi_color,
+            use_pin_hole=use_pin_hole,
+        )
 
-    rtstruct.save(output_rtstruct_path)
-    logging.info("RTSTRUCT saved to: %s", os.path.abspath(output_rtstruct_path))
+        rtstruct.save(output_rtstruct_path)
+        logging.info("RTSTRUCT saved to: %s", os.path.abspath(output_rtstruct_path))
+    finally:
+        if tmpdir is not None:
+            tmpdir.cleanup()
 
 
 def generate_rtstruct_files(
@@ -261,39 +315,32 @@ def generate_rtstruct_files(
             tz_mask = _prepare_mask_from_array(data == 1)
             pz_mask = _prepare_mask_from_array(data == 2)
 
-            # Create a single RTSTRUCT with multiple ROIs for organ zones.
-            rtstruct = RTStructBuilder.create_new(dicom_series_path=str(t2_dicom_series_path))
+            patched_path, tmpdir = _ensure_study_id(str(t2_dicom_series_path))
+            try:
+                rtstruct = RTStructBuilder.create_new(dicom_series_path=patched_path)
 
-            # Whole prostate (union of TZ+PZ) – keeps backward-compatible organ concept.
-            # if whole_mask.any():
-            #     rtstruct.add_roi(
-            #         mask=whole_mask,
-            #         name="Prostate_Organ",
-            #         color=[0, 255, 0],  # Green
-            #         use_pin_hole=True,
-            #     )
+                if tz_mask.any():
+                    rtstruct.add_roi(
+                        mask=tz_mask,
+                        name="Prostate_TZ",
+                        color=[0, 0, 255],
+                        use_pin_hole=True,
+                    )
 
-            # Transition Zone (TZ)
-            if tz_mask.any():
-                rtstruct.add_roi(
-                    mask=tz_mask,
-                    name="Prostate_TZ",
-                    color=[0, 0, 255],  # Blue
-                    use_pin_hole=True,
-                )
+                if pz_mask.any():
+                    rtstruct.add_roi(
+                        mask=pz_mask,
+                        name="Prostate_PZ",
+                        color=[255, 255, 0],
+                        use_pin_hole=True,
+                    )
 
-            # Peripheral Zone (PZ)
-            if pz_mask.any():
-                rtstruct.add_roi(
-                    mask=pz_mask,
-                    name="Prostate_PZ",
-                    color=[255, 255, 0],  # Yellow
-                    use_pin_hole=True,
-                )
-
-            rtstruct.save(str(organ_rtstruct_path))
-            results["organ_rtstruct"] = str(organ_rtstruct_path)
-            logging.info("Organ RTSTRUCT created (multi-class): %s", organ_rtstruct_path)
+                rtstruct.save(str(organ_rtstruct_path))
+                results["organ_rtstruct"] = str(organ_rtstruct_path)
+                logging.info("Organ RTSTRUCT created (multi-class): %s", organ_rtstruct_path)
+            finally:
+                if tmpdir is not None:
+                    tmpdir.cleanup()
         except Exception as exc:  # pragma: no cover - logging path
             logging.error("Failed to create organ RTSTRUCT: %s", exc)
     else:

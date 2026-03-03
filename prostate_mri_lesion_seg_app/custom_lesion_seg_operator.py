@@ -255,34 +255,35 @@ class ProstateLesionSegOperator(Operator):
         print("\nBeginning lesion segmentation...")
 
         # Instantiate network and send to GPU
-        # nets = [
-        #     RRUNet3D(
-        #     in_channels=3,
-        #     out_channels=2,
-        #     blocks_down="1,2,3,4",
-        #     blocks_up="3,2,1",
-        #     num_init_kernels=32,
-        #     recurrent=False,
-        #     residual=True,
-        #     attention=False,
-        #     debug=False,
-        #     )
-        #     for _ in range(5)
-        # ]
-        nets = [RRUNet3D(
+        nets = [
+            RRUNet3D(
             in_channels=3,
             out_channels=2,
-            blocks_down="2,2,3,3",
-            blocks_up="3,3,2",
+            blocks_down="1,2,3,4",
+            blocks_up="3,2,1",
             num_init_kernels=32,
-            recurrent=True,
+            recurrent=False,
             residual=True,
-            attention=True,
-            se=True,
+            attention=False,
+            se=False, 
             debug=False,
             )
             for _ in range(5)
         ]
+        # nets = [RRUNet3D(
+        #     in_channels=3,
+        #     out_channels=2,
+        #     blocks_down="2,2,3,3",
+        #     blocks_up="3,3,2",
+        #     num_init_kernels=32,
+        #     recurrent=True,
+        #     residual=True,
+        #     attention=True,
+        #     se=True,
+        #     debug=False,
+        #     )
+        #     for _ in range(5)
+        # ]
         if torch.cuda.is_available():
             nets = [net.to("cuda") for net in nets]
         for net in nets:
@@ -484,7 +485,8 @@ class ProstateLesionSegOperator(Operator):
         print("nda_prob std:", np.std(nda_prob))
 
         # Create lesion mask
-        threshold = 0.6344772701607316
+        # threshold = 0.6344772701607316
+        threshold = 0.63
         nda_prob = (nda_prob >= threshold).astype(np.uint8)
         nib.save(nib.Nifti1Image(nda_prob, affine), str(output_path) + "/lesion/" + "lesion_mask.nii.gz")
 

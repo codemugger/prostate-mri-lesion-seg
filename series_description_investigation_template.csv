@@ -1,0 +1,15 @@
+case_id,series_group_id,series_folder,source_path,series_instance_uid,study_instance_uid,series_number,series_description,protocol_name,sequence_name,modality,image_type,body_part,acquisition_type,scan_options,echo_time_ms,repetition_time_ms,inversion_time_ms,flip_angle_deg,b_value,contrast_agent,orientation,slice_thickness_mm,pixel_spacing,regex_candidate,regex_match_result,notes
+ProstateX-0000,1,,test-data/ProstateX-0000,,,,,,,,,,,,,,,,,,,,,,"DICOMs are in case root; fill from header"
+ProstateX-0001,1,,test-data/ProstateX-0001,,,,,,,,,,,,,,,,,,,,,,"DICOMs are in case root; fill from header"
+ProstateX-0004,1,,test-data/ProstateX-0004,,,,,,,,,,,,,,,,,,,,,,"DICOMs are in case root; fill from header"
+sgh_data_patient_1,1,,test-data/sgh_data_patient_1,,,,,,,,,,,,,,,,,,,,,,"DICOMs are in case root; fill from header"
+sgh_data_patient_3,1,,test-data/sgh_data_patient_3,,,,,,,,,,,,,,,,,,,,,,"DICOMs are in case root; fill from header"
+sgh_data_patient_4,1,,test-data/sgh_data_patient_4,,,,,,,,,,,,,,,,,,,,,,"DICOMs are in case root; fill from header"
+sgh_data_patient_2,1,"AX DWI_diff_b50- b500-b1000-b1800_ADC_1.2.826.0.1.3680043.8.498.37812055972126007893281440237440525815","test-data/sgh_data_patient_2/AX DWI_diff_b50- b500-b1000-b1800_ADC_1.2.826.0.1.3680043.8.498.37812055972126007893281440237440525815",,,,,,,,,,,,,,,,,,,,,,,
+sgh_data_patient_2,2,"AX DWI_diff_b50- b500-b1000-b1800_TRACEW_1.2.826.0.1.3680043.8.498.30544969662671644024926039002071326289","test-data/sgh_data_patient_2/AX DWI_diff_b50- b500-b1000-b1800_TRACEW_1.2.826.0.1.3680043.8.498.30544969662671644024926039002071326289",,,,,,,,,,,,,,,,,,,,,,,
+sgh_data_patient_2,3,"AX_t1_tse whole pelvis_1.2.826.0.1.3680043.8.498.58837404629504819789970118211198114042","test-data/sgh_data_patient_2/AX_t1_tse whole pelvis_1.2.826.0.1.3680043.8.498.58837404629504819789970118211198114042",,,,,,,,,,,,,,,,,,,,,,,
+sgh_data_patient_2,4,"AX_t1_tse_1.2.826.0.1.3680043.8.498.13235048937608250683195459278666896700","test-data/sgh_data_patient_2/AX_t1_tse_1.2.826.0.1.3680043.8.498.13235048937608250683195459278666896700",,,,,,,,,,,,,,,,,,,,,,,
+sgh_data_patient_2,5,"AX_T1_vibe_Whole Pelvis POST CONTRAST_W_1.2.826.0.1.3680043.8.498.62527794151740031224521826257072602569","test-data/sgh_data_patient_2/AX_T1_vibe_Whole Pelvis POST CONTRAST_W_1.2.826.0.1.3680043.8.498.62527794151740031224521826257072602569",,,,,,,,,,,,,,,,,,,,,,,
+sgh_data_patient_2,6,"AX_T2 FS whole pelvis_1.2.826.0.1.3680043.8.498.10732139971952043058917379139336199115","test-data/sgh_data_patient_2/AX_T2 FS whole pelvis_1.2.826.0.1.3680043.8.498.10732139971952043058917379139336199115",,,,,,,,,,,,,,,,,,,,,,,
+sgh_data_patient_2,7,"AX_t2_tse_1.2.826.0.1.3680043.8.498.11301955781680555035955571669553642195","test-data/sgh_data_patient_2/AX_t2_tse_1.2.826.0.1.3680043.8.498.11301955781680555035955571669553642195",,,,,,,,,,,,,,,,,,,,,,,
+sgh_data_patient_2,8,"SAG_t2_tse_1.2.826.0.1.3680043.8.498.61314708716880866771539362228036270035","test-data/sgh_data_patient_2/SAG_t2_tse_1.2.826.0.1.3680043.8.498.61314708716880866771539362228036270035",,,,,,,,,,,,,,,,,,,,,,,

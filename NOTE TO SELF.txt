@@ -11,3 +11,9 @@ NOTE TO SELF AFTER 11 DEC 0946H:
 - App now successfully generates MULTI-CLASS Prostate Segmentation, showing the P-TZONE and T-ZONE 
 - README has been updated to reflect the latest pipelines and app features
 - Pending 
+
+NOTE TO SELF AFTER 15 DEC 1316H:
+- We begin with lesion training, current DICE score only 0.2. 
+- We try to modify lesion training pipeline and config, and integrate p158 practices
+- To bear in mind of the existing monai app pipeline and not configure too much 
+
