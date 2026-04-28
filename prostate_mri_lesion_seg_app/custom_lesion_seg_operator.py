@@ -80,7 +80,7 @@ from torch.utils.data import Dataset
 # Local imports
 from rrunet3D import RRUNet3D
 from common import standard_normalization_multi_channel
-from rtstruct_utils import generate_rtstruct_files
+from rtstruct_utils import generate_rtstruct_files, find_dicom_series_by_uid
 
 def bbox2_3D(img):
     r = np.any(img, axis=(1, 2))
@@ -101,26 +101,47 @@ class SegmentationDataset(Dataset):
     def __len__(self):
         return 1
 
+    @staticmethod
+    def _ensure_sitk_3d(img):
+        """Promote a 2D SimpleITK image to 3D (single slice).
+
+        Single-slice NIfTI files may be loaded as 2D by SimpleITK, which
+        causes dimension mismatches in sitk.Resample when the reference
+        image is 3D (or vice versa).
+        """
+        if img.GetDimension() == 2:
+            img = sitk.JoinSeries([img])
+        return img
+
+    @staticmethod
+    def _ensure_nib_3d(data):
+        """Ensure nibabel array data is at least 3D."""
+        if data.ndim == 2:
+            data = data[..., np.newaxis]
+        return data
+
     def __getitem__(self, idx):
         """Preprocesses input data for model prediction"""
         # Load T2 as reference image
         t2_path = f"{self.output_path}/t2/t2.nii.gz"
-        t2_sitk = sitk.ReadImage(t2_path)
+        t2_sitk = self._ensure_sitk_3d(sitk.ReadImage(t2_path))
         t2_nib = nib.load(t2_path)
         affine_orig = t2_nib.affine
         spacing_orig = t2_nib.header.get_zooms()
+        if len(spacing_orig) < 3:
+            spacing_orig = tuple(list(spacing_orig) + [1.0] * (3 - len(spacing_orig)))
 
         # Initialize data arrays
         nda = []
 
         # Load T2 data
         t2_canonical = nib.as_closest_canonical(t2_nib)
-        nda.append(t2_canonical.get_fdata())
+        nda.append(self._ensure_nib_3d(t2_canonical.get_fdata()))
 
         # Process ADC and HighB images
         for modality in ['adc', 'highb']:
             img_path = f"{self.output_path}/{modality}/{modality}.nii.gz"
-            img_sitk = sitk.ReadImage(img_path)
+            img_sitk = self._ensure_sitk_3d(sitk.ReadImage(img_path))
 
             # Resample to match T2 dimensions
             img_resampled = sitk.Resample(
@@ -137,7 +158,7 @@ class SegmentationDataset(Dataset):
 
             # Load resampled data
             img_nib = nib.as_closest_canonical(nib.load(img_path))
-            nda.append(img_nib.get_fdata())
+            nda.append(self._ensure_nib_3d(img_nib.get_fdata()))
 
         # Stack input modalities
         nda = np.stack(nda, axis=0).astype(np.float32)
@@ -146,11 +167,12 @@ class SegmentationDataset(Dataset):
         # Load prostate segmentation
         wp_path = f"{self.output_path}/organ/organ.nii.gz"
         wp_nib = nib.as_closest_canonical(nib.load(wp_path))
-        nda_wp = (wp_nib.get_fdata() > 0.0).astype(np.float32)
+        nda_wp = (self._ensure_nib_3d(wp_nib.get_fdata()) > 0.0).astype(np.float32)
 
         if nda_wp.shape != tuple(nda_shape):
-            print("[error] nda_wp.shape != tuple(nda_shape)")
-            input()
+            print(f"[WARNING] nda_wp.shape {nda_wp.shape} != nda_shape {tuple(nda_shape)}, "
+                  "resizing organ mask to match.")
+            nda_wp = resize(nda_wp, output_shape=nda_shape, order=0).astype(np.float32)
 
         # Calculate target shape for resampling
         spacing_target = (0.5, 0.5, 0.5)
@@ -165,7 +187,12 @@ class SegmentationDataset(Dataset):
 
         # Calculate ROI with margin
         margin = 32
-        bbox = bbox2_3D(nda_wp_resize)
+        if np.any(nda_wp_resize):
+            bbox = bbox2_3D(nda_wp_resize)
+        else:
+            print("[WARNING] Organ mask is empty — using full volume as ROI. "
+                  "Lesion segmentation results will be unreliable.")
+            bbox = [0, shape_target[0] - 1, 0, shape_target[1] - 1, 0, shape_target[2] - 1]
         bbox_new = np.array(bbox)
         for i in range(3):
             bbox_new[2*i] = max(0, bbox[2*i] - margin)
@@ -245,107 +272,240 @@ class ProstateLesionSegOperator(Operator):
         if not image_organ_seg:
             raise ValueError("Input image (Organ segmentation) is not found.")
 
-        # Set relevant metadata and save to disk as nii
-        input_image_t2._metadata["affine"] = input_image_t2._metadata["nifti_affine_transform"]
-        input_image_adc._metadata["affine"] = input_image_adc._metadata["nifti_affine_transform"]
-        input_image_highb._metadata["affine"] = input_image_highb._metadata["nifti_affine_transform"]
-        image_organ_seg._metadata["affine"] = image_organ_seg._metadata["nifti_affine_transform"]
+        # Solution B: minimum-slice guard — flag series with too few slices
+        MIN_SLICES = 3
+        modality_images = {
+            "T2": input_image_t2,
+            "ADC": input_image_adc,
+            "HIGHB": input_image_highb,
+        }
+        for mod_name, img in modality_images.items():
+            ndim = img.asnumpy().ndim
+            depth = img.asnumpy().shape[-1] if ndim >= 3 else 1
+            if depth < MIN_SLICES:
+                self.logger.warning(
+                    "%s series has only %d slice(s) (minimum recommended: %d). "
+                    "Affine transform may be missing and model quality will be poor.",
+                    mod_name, depth, MIN_SLICES,
+                )
+
+        # Solution A: graceful affine fallback — try nifti_affine_transform,
+        # then dicom_affine_transform, then identity matrix.
+        for mod_name, img in [("T2", input_image_t2), ("ADC", input_image_adc),
+                              ("HIGHB", input_image_highb), ("Organ", image_organ_seg)]:
+            meta = img._metadata
+            if "nifti_affine_transform" in meta:
+                meta["affine"] = meta["nifti_affine_transform"]
+            elif "dicom_affine_transform" in meta:
+                self.logger.warning(
+                    "%s: 'nifti_affine_transform' missing, falling back to "
+                    "'dicom_affine_transform'. Likely too few slices in this series.",
+                    mod_name,
+                )
+                meta["affine"] = meta["dicom_affine_transform"]
+            else:
+                self.logger.warning(
+                    "%s: No affine transform found in metadata. Using identity matrix. "
+                    "This series likely has only 1 slice — results will be unreliable.",
+                    mod_name,
+                )
+                meta["affine"] = np.eye(4)
+
         self.convert_and_save(input_image_t2, input_image_adc, input_image_highb, image_organ_seg, self.output_folder)
 
-        print("\nBeginning lesion segmentation...")
+        # Guard: skip lesion inference when the organ model found no prostate.
+        # When the organ mask is empty the model has nothing to segment within,
+        # and the downstream tiling / bbox logic would operate on a meaningless
+        # full-volume ROI.  This typically happens with very-thin SGH series
+        # (1-6 slices) where the 3-D organ model cannot detect the prostate.
+        #
+        # NOTE: we intentionally do NOT check the raw T2 slice count here.
+        # ProstateX data has only ~19 original slices but these are resampled
+        # to ~114 slices at 0.5 mm target spacing — perfectly valid for the
+        # model's 32-voxel tiling requirement.
+        organ_max = image_organ_seg.asnumpy().max()
+        skip_lesion_inference = organ_max == 0
 
-        # Instantiate network and send to GPU
-        nets = [
-            RRUNet3D(
-            in_channels=3,
-            out_channels=2,
-            blocks_down="1,2,3,4",
-            blocks_up="3,2,1",
-            num_init_kernels=32,
-            recurrent=False,
-            residual=True,
-            attention=False,
-            se=False, 
-            debug=False,
+        if skip_lesion_inference:
+            self.logger.warning(
+                "Skipping lesion inference: organ mask is empty (max=%.1f). "
+                "Returning empty lesion mask.",
+                float(organ_max),
             )
-            for _ in range(5)
-        ]
-        # nets = [RRUNet3D(
-        #     in_channels=3,
-        #     out_channels=2,
-        #     blocks_down="2,2,3,3",
-        #     blocks_up="3,3,2",
-        #     num_init_kernels=32,
-        #     recurrent=True,
-        #     residual=True,
-        #     attention=True,
-        #     se=True,
-        #     debug=False,
-        #     )
-        #     for _ in range(5)
-        # ]
-        if torch.cuda.is_available():
-            nets = [net.to("cuda") for net in nets]
-        for net in nets:
-            net.eval()
+            empty_arr = np.zeros_like(input_image_t2.asnumpy())
+            lesion_mask = Image(data=empty_arr, metadata=input_image_t2.metadata())
 
-        # Set model weights to models in container
-        tags = ["fold0", "fold1", "fold2", "fold3", "fold4"]
-        weight_files = [
-            self.model_path / tags[0] / "model_best_fold0.pth.tar",
-            self.model_path / tags[1] / "model_best_fold1.pth.tar",
-            self.model_path / tags[2] / "model_best_fold2.pth.tar",
-            self.model_path / tags[3] / "model_best_fold3.pth.tar",
-            self.model_path / tags[4] / "model_best_fold4.pth.tar",
-        ]
-
-        # Create DataLoader and preprocess image
-        print("Loading input...")
-        validation_dataset = SegmentationDataset(output_path=self.output_folder, data_purpose="testing")
-        validation_loader = torch.utils.data.DataLoader(validation_dataset, batch_size=1, shuffle=False, num_workers=1)
-        data = next(iter(validation_loader))
-        if torch.cuda.is_available():
-            inputs = data["image"].to("cuda")
+            lesion_dir = Path(self.output_folder) / "lesion"
+            lesion_dir.mkdir(parents=True, exist_ok=True)
+            affine = input_image_t2.metadata().get(
+                "nifti_affine_transform",
+                input_image_t2.metadata().get("dicom_affine_transform", np.eye(4)),
+            )
+            nib.save(
+                nib.Nifti1Image(empty_arr.T, affine),
+                str(lesion_dir / "lesion_mask.nii.gz"),
+            )
         else:
-            inputs = data["image"]
-        inputs_shape = ( inputs.size()[-3], inputs.size()[-2], inputs.size()[-1])
+            print("\nBeginning lesion segmentation...")
 
-        def run_inference(tag, model_name, net):
-            self.custom_inference(
-            data=data,
-            inputs=inputs,
-            inputs_shape=inputs_shape,
-            net=net,
-            output_path=self.output_folder,
-            model_name=model_name,
-            tag=tag,
+            # Instantiate network and send to GPU
+            nets = [
+                RRUNet3D(
+                in_channels=3,
+                out_channels=2,
+                blocks_down="1,2,3,4",
+                blocks_up="3,2,1",
+                num_init_kernels=32,
+                recurrent=False,
+                residual=True,
+                attention=False,
+                se=False, 
+                debug=False,
+                )
+                for _ in range(5)
+            ]
+            # nets = [RRUNet3D(
+            #     in_channels=3,
+            #     out_channels=2,
+            #     blocks_down="2,2,3,3",
+            #     blocks_up="3,3,2",
+            #     num_init_kernels=32,
+            #     recurrent=True,
+            #     residual=True,
+            #     attention=True,
+            #     se=True,
+            #     debug=False,
+            #     )
+            #     for _ in range(5)
+            # ]
+            if torch.cuda.is_available():
+                nets = [net.to("cuda") for net in nets]
+            for net in nets:
+                net.eval()
+
+            # Set model weights to models in container
+            tags = ["fold0", "fold1", "fold2", "fold3", "fold4"]
+            weight_files = [
+                self.model_path / tags[0] / "model_best_fold0.pth.tar",
+                self.model_path / tags[1] / "model_best_fold1.pth.tar",
+                self.model_path / tags[2] / "model_best_fold2.pth.tar",
+                self.model_path / tags[3] / "model_best_fold3.pth.tar",
+                self.model_path / tags[4] / "model_best_fold4.pth.tar",
+            ]
+
+            # Create DataLoader and preprocess image
+            print("Loading input...")
+            validation_dataset = SegmentationDataset(output_path=self.output_folder, data_purpose="testing")
+            validation_loader = torch.utils.data.DataLoader(validation_dataset, batch_size=1, shuffle=False, num_workers=1)
+            data = next(iter(validation_loader))
+            if torch.cuda.is_available():
+                inputs = data["image"].to("cuda")
+            else:
+                inputs = data["image"]
+            inputs_shape = ( inputs.size()[-3], inputs.size()[-2], inputs.size()[-1])
+
+            def run_inference(tag, model_name, net):
+                self.custom_inference(
+                data=data,
+                inputs=inputs,
+                inputs_shape=inputs_shape,
+                net=net,
+                output_path=self.output_folder,
+                model_name=model_name,
+                tag=tag,
+                )
+
+            import concurrent.futures
+
+            # Perform inference in parallel
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = [executor.submit(run_inference, tags[i], weight_files[i], nets[i]) for i in range(len(tags))]
+                concurrent.futures.wait(futures)
+
+            # Convert to Image and transpose back to DHW
+            lesion_mask = self.merge_volumes(output_path=self.output_folder, data=data, tags=tags)
+            lesion_mask = Image(
+                data=lesion_mask.T, metadata=input_image_t2.metadata()
             )
 
-        import concurrent.futures
-
-        # Perform inference in parallel
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = [executor.submit(run_inference, tags[i], weight_files[i], nets[i]) for i in range(len(tags))]
-            concurrent.futures.wait(futures)
-
-        # Convert to Image and transpose back to DHW
-        lesion_mask = self.merge_volumes(output_path=self.output_folder, data=data, tags=tags)
-        lesion_mask = Image(
-            data=lesion_mask.T, metadata=input_image_t2.metadata()
-        )
-
-        # Generate RTSTRUCT files for organ and lesion masks
+        # Generate RTSTRUCT files for organ and lesion masks.
+        # Pass the T2 SeriesInstanceUID so the RTSTRUCT is built from the exact
+        # same DICOM series the pipeline selected (not a heuristic guess).
+        t2_series_uid = input_image_t2.metadata().get("SeriesInstanceUID")
         try:
             generate_rtstruct_files(
                 output_folder=self.output_folder,
                 input_folder=Path(self.app_context.input_path),
+                t2_series_instance_uid=str(t2_series_uid) if t2_series_uid else None,
             )
         except Exception as e:
             self.logger.error(f"Failed to generate RTSTRUCT files: {e}")
 
+        # Copy the selected DICOM series (T2, ADC, HIGHB) into output so that
+        # radiologists can import DICOMs + RTSTRUCTs together into a viewer.
+        self._copy_selected_dicom_series(
+            input_path=Path(self.app_context.input_path),
+            output_path=Path(self.output_folder),
+            images={"t2": input_image_t2, "adc": input_image_adc, "highb": input_image_highb},
+        )
+
         # Now emit data to the output ports of this operator
         op_output.emit(lesion_mask, self.output_name_seg)
         op_output.emit(self.output_folder, self.output_name_saved_images_folder)
+
+    def _copy_selected_dicom_series(
+        self,
+        input_path: Path,
+        output_path: Path,
+        images: dict,
+    ) -> None:
+        """Copy the pipeline-selected DICOM series into ``<output>/dicom/{t2,adc,highb}/``.
+
+        Each *images* value is a MONAI Image whose metadata contains
+        ``SeriesInstanceUID``.  The matching folder in *input_path* is located
+        by UID and its ``.dcm`` files are copied.
+        """
+        import shutil
+
+        copied_uids: dict[str, str] = {}
+
+        for label, img in images.items():
+            uid = str(img.metadata().get("SeriesInstanceUID", ""))
+            if not uid:
+                self.logger.warning("No SeriesInstanceUID in %s metadata — skipping DICOM copy.", label)
+                continue
+
+            dst_dir = output_path / "dicom" / label
+            dst_dir.mkdir(parents=True, exist_ok=True)
+
+            if uid in copied_uids:
+                src_already = copied_uids[uid]
+                self.logger.info(
+                    "DICOM copy: %s shares SeriesInstanceUID with %s — symlinking.",
+                    label, src_already,
+                )
+                already_dir = output_path / "dicom" / src_already
+                for f in already_dir.iterdir():
+                    target = dst_dir / f.name
+                    if not target.exists():
+                        shutil.copy2(str(f), str(target))
+                continue
+
+            src_dir = find_dicom_series_by_uid(input_path, uid)
+            if src_dir is None:
+                self.logger.warning(
+                    "DICOM copy: could not find folder for %s UID %s", label, uid,
+                )
+                continue
+
+            count = 0
+            for f in src_dir.iterdir():
+                if f.is_file() and f.suffix.lower() == ".dcm" and ":" not in f.name:
+                    shutil.copy2(str(f), str(dst_dir / f.name))
+                    count += 1
+
+            self.logger.info("DICOM copy: %s — %d files from %s", label, count, src_dir.name)
+            copied_uids[uid] = label
 
     def convert_and_save(self, image1, image2, image3, organ_mask, output_path):
         """Converts and saves the input Images on disk in nii.gz format."""

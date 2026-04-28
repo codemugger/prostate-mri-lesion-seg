@@ -261,7 +261,19 @@ class ProstateLesionClassifierOperator(Operator):
         highb_metatensor = MetaTensor(highb[None], meta=highb_metadata)
         organ_metatensor = MetaTensor(organ[None], meta=organ_metadata)
         lesion_metatensor = MetaTensor(lesion[None], meta=lesion_metadata)
-        affine_orig = torch.tensor(t2_metadata["nifti_affine_transform"])
+        if "nifti_affine_transform" in t2_metadata:
+            affine_orig = torch.tensor(t2_metadata["nifti_affine_transform"])
+        elif "dicom_affine_transform" in t2_metadata:
+            logging.warning(
+                "Classifier: 'nifti_affine_transform' missing, "
+                "falling back to 'dicom_affine_transform'."
+            )
+            affine_orig = torch.tensor(t2_metadata["dicom_affine_transform"])
+        else:
+            logging.warning(
+                "Classifier: No affine transform found. Using identity matrix."
+            )
+            affine_orig = torch.eye(4)
 
         # Resample images to match T2
         print("Resampling ADC/HIGHB to match T2...")

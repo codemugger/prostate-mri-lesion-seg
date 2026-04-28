@@ -4,12 +4,19 @@
 /models_backup
 /output 
 /output_beta
+/output_charlie 
+output_beta/
 /test-data
 /p158-inspiration
 /data_backup
+@docker/docker_image.tar
+
+
 
 # Windows / macOS metadata files (often appear after copying/unzipping datasets)
 .Identifier
 *.Identifier
 
 /PROSTATEx_masks
+/ORIGINAL prostate-mri-lesion-seg REFERENCE
+

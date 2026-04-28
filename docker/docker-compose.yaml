@@ -1,0 +1,27 @@
+# Prostate MRI Lesion Segmentation – Docker Compose
+#
+# All paths below are relative to THIS file (docker/).
+# Override with environment variables when running on HIVE:
+#
+#   INPUT_DIR=/hive/data/patient01  \
+#   OUTPUT_DIR=/hive/output/patient01 \
+#   MODEL_DIR=/hive/models            \
+#   docker compose -f docker/docker-compose.yaml up
+
+services:
+  prostate-mri-seg:
+    image: prostate-mri-seg:latest
+    container_name: prostate-mri-seg
+    shm_size: "1g"
+    volumes:
+      - ${INPUT_DIR:-../test-data/ProstateX-0004}:/input:ro
+      - ${OUTPUT_DIR:-../output}:/output
+      - ${MODEL_DIR:-../prostate_mri_lesion_seg_app/models}:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all

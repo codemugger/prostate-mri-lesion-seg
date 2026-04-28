@@ -54,7 +54,9 @@ with the conditions stated in this Agreement. Whenever Recipient distributes or
 redistributes the SOFTWARE, a copy of this Agreement must be included with
 each copy of the SOFTWARE.'''
 
+import copy
 import logging
+import math
 from pathlib import Path
 
 # MONAI Deploy SDK imports
@@ -70,7 +72,116 @@ from custom_lesion_seg_operator import ProstateLesionSegOperator
 from custom_lesion_classifier_operator import ProstateLesionClassifierOperator
 
 
-# Custom rules for T2, ADC, and HIGHB series selection in ProstateX
+# ---------------------------------------------------------------------------
+# Monkeypatch: fix DICOMSeriesToVolumeOperator.prepare_series
+#
+# The upstream implementation has two bugs with SGH de-identified DICOM data:
+# 1. Slice removal uses enumerate() indices instead of the actual indices,
+#    deleting the wrong slices.
+# 2. After (broken) removal, surviving instances without `.distance` crash the
+#    sort with: AttributeError: 'DICOMSOPInstance' has no attribute 'distance'
+# ---------------------------------------------------------------------------
+def _patched_prepare_series(self, series):
+    if len(series._sop_instances) <= 1:
+        series.depth_pixel_spacing = 1.0
+        return
+
+    slice_indices_to_be_removed = []
+    last_slice_normal = [0.0, 0.0, 0.0]
+
+    for slice_index, slc in enumerate(series._sop_instances):
+        distance = 0.0
+        point = [0.0, 0.0, 0.0]
+        slice_normal = [0.0, 0.0, 0.0]
+        slice_position = None
+        cosines = None
+
+        try:
+            de = slc[0x0020, 0x0037]
+            if de is not None:
+                cosines = de.value
+        except KeyError:
+            pass
+
+        try:
+            de = slc[0x0020, 0x0032]
+            if de is not None:
+                slice_position = de.value
+        except KeyError:
+            pass
+
+        if (cosines is not None) and (slice_position is not None):
+            slice_normal[0] = cosines[1] * cosines[5] - cosines[2] * cosines[4]
+            slice_normal[1] = cosines[2] * cosines[3] - cosines[0] * cosines[5]
+            slice_normal[2] = cosines[0] * cosines[4] - cosines[1] * cosines[3]
+            last_slice_normal = copy.deepcopy(slice_normal)
+
+            for i in range(3):
+                point[i] = slice_normal[i] * slice_position[i]
+            distance = point[0] + point[1] + point[2]
+
+            series._sop_instances[slice_index].distance = distance
+            series._sop_instances[slice_index].first_pixel_on_slice_normal = point
+        else:
+            logging.debug("Removing slice %d: missing orientation/position", slice_index)
+            slice_indices_to_be_removed.append(slice_index)
+
+    # Delete in reverse order so indices stay valid
+    for idx in reversed(slice_indices_to_be_removed):
+        del series._sop_instances[idx]
+
+    if not series._sop_instances:
+        raise ValueError("All DICOM slices removed — series has no spatial metadata.")
+
+    # Fallback: if any remaining instance still lacks .distance, sort by InstanceNumber
+    if all(hasattr(s, "distance") for s in series._sop_instances):
+        series._sop_instances = sorted(series._sop_instances, key=lambda s: s.distance)
+    else:
+        logging.warning(
+            "Some slices missing 'distance'; falling back to InstanceNumber sort."
+        )
+        series._sop_instances = sorted(
+            series._sop_instances,
+            key=lambda s: int(getattr(s, "InstanceNumber", 0) or 0),
+        )
+
+    series.depth_direction_cosine = copy.deepcopy(last_slice_normal)
+
+    if len(series._sop_instances) > 1:
+        p1 = series._sop_instances[0].first_pixel_on_slice_normal
+        p2 = series._sop_instances[1].first_pixel_on_slice_normal
+        depth_pixel_spacing = math.sqrt(
+            (p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2 + (p1[2] - p2[2]) ** 2
+        )
+        series.depth_pixel_spacing = depth_pixel_spacing
+
+    s_1 = series._sop_instances[0]
+    s_n = series._sop_instances[-1]
+    num_slices = len(series._sop_instances)
+    self.compute_affine_transform(s_1, s_n, num_slices, series)
+
+
+DICOMSeriesToVolumeOperator.prepare_series = _patched_prepare_series
+
+
+# Series selection rules for T2, ADC, and HIGHB.
+#
+# Derived from Dr. Anh Tuan Doan's manual annotation of ~3,500 SGH cases
+# (series_description_sgh_deid_data.tnt_with_anh_input.csv, Apr 2026).
+# Validated at 100% precision / 100% recall on 43,470 annotated rows via
+# scripts/validate_selection_rules.py.
+#
+# T2   : must contain "t2" AND (tra|ax|axial); excludes any series with
+#        oblique/coronal/sagittal plane, whole-pelvis FOV, TIRM/STIR,
+#        SPACE, fat-sat, or any ADC/DWI/diff/TRACEW markers.
+# ADC  : contains "adc"; excludes localizer/survey.
+# HIGHB: contains any of tracew/dwi/diff/calc/compute(d), OR
+#        focus|muse followed by a b-value; excludes any series that also
+#        contains "adc" (so ADC+TRACEW series route to ADC, not HIGHB).
+#
+# ImageType is intentionally NOT required here because SGH data frequently
+# lacks this field; the regex alone is strict enough to separate classes.
+
 Rules_T2 = """
 {
     "selections": [
@@ -79,19 +190,7 @@ Rules_T2 = """
             "conditions" :
             {
                 "Modality": "MR",
-                "ImageType": [
-                            "ORIGINAL",
-                            "PRIMARY"
-                        ],
-                "SeriesDescription": "((?=AX T2)|(?=AX T2  6 NSA)|(?=AX T2  FAST)|(?=AX T2 . voxel 7x.8)|(?=AX T2 B1 Default)|(?=AX T2 CS)|(?=AX T2 cs 3.0)|(?=AX T2 FAST)|(?=AX T2 FRFSE)|(?=AX T2 N/S)|(?=AX T2 No sense)|(?=AX T2 NS)|(?=AX T2 NSA 3)|(?=AX T2 NSA 4)|(?=AX T2 NSA 5)|(?=AX T2 PROP)|(?=Ax T2 PROSTATE)|(?=AX T2 SMALL FOV)|(?=Ax T2 thin FRFSE)|(?=sT2 TSE ax no post)|(?=T2 AX)|(?=T2 AX SMALL FOV[*]? IF MOTION REPEAT[*]?)|(?=T2 AXIAL 3MM)|(?=T2 TRA 3mm)|(?=T2 TSE Ax)|(?=T2 TSE ax cs)|(?=T2 TSE ax hi)|(?=T2 TSE ax hi sense)|(?=T2 TSE ax no sense)|(?=T2 TSE ax NS)|(?=T2 TSE ax NSA 3)|(?=t2_tse_tra)|(?=t2_tse_tra_320_p2)|(?=t2_tse_tra_3mm _SFOV_TE 92)|(?=t2_tse_tra_Grappa3)|(?=T2W_TSE)|(?=T2W_TSE_ax)|(?=T2W_TSE_ax PSS Refoc 52)|(?=T2W_TSE_ax zoom PSS Refoc)|(?=et2_tse_tra)|(?=AX_t2_tse)|(?=t2_tse_tra_fast-blade))"
-            }
-        },
-        {
-            "name": "t2",
-            "conditions" :
-            {
-                "Modality": "MR",
-                "SeriesDescription": "((?=et2_tse_tra)|(?=AX_t2_tse)|(?=t2_tse_tra_fast-blade))"
+                "SeriesDescription": "^(?!.*(?:obl|oblq|oblique|obq|cor|sag|pelvis|whole[_ ]?pelvis|wholepelvis|tirm|stir|space|localizer|survey|t1|\\\\+c|adc|dwi|diff|tracew?|_fs_|_fs\\\\b|\\\\bfs_|\\\\bfs\\\\b))(?=.*t2)(?=.*(?:tra|\\\\bax\\\\b|axial|^ax[_ ]|_ax[_ ]|AX[_ ])).*"
             }
         }
     ]
@@ -106,19 +205,7 @@ Rules_ADC = """
             "conditions":
             {
                 "Modality": "MR",
-                "ImageType": [
-                            "DIFFUSION",
-                            "ADC"
-                        ],
-                "SeriesDescription": "((?=ADC (10^-6 mm²/s))|(?=Apparent Diffusion Coefficient (mm2/s))|(?=AX DIFFUSION_ADC_DFC_MIX)|(?=.*AX DWI (50,1500)_ADC.*)|(?=AX DWI_ADC_DFC_MIX)|(?=b_1500 prostate_ADC)|(?=b_2000 prostate_ADC)|(?=d3B ADC 3B 750  ERC SSh_DWI FAST SENSE)|(?=dADC)|(?=dADC 0_1500)|(?=dADC 100 400 600)|(?=dADC 2)|(?=dADC 3)|(?=dADC ALL)|(?=dADC b 0 1000 2000)|(?=dADC from 0_1500)|(?=dADC from b0_600)|(?=dADC from B0-1500)|(?=dADC Map)|(?=dADC map 1)|(?=dADC MAP 2)|(?=dADC_1 axial)|(?=dADC_b375_750_1150)|(?=ddADC MAP)|(?=DIFF bv1400_ADC)|(?=diff tra b 50 500 800 WIP511b alle spoelen_ADC)|(?=diffusie-3Scan-4bval_fs_ADC)|(?=dReg - WIP SSh_DWI FAST SENSE)|(?=dSSh_DWI SENSE)|(?=DWI PROSTATE_ADC)|(?=dWIP 3B 600 w ERC SSh_DWI S2Ovs2)|(?=dWIP 3B ADC 3B 600 w/o ERC SSh_DWI FAST SENSE)|(?=dWIP SSh_DWI FAST SENSE)|(?=ep2d_diff_new 16 measipat_ADC)|(?=ep2d_DIFF_tra_b50_500_800_1400_alle_spoelen_ADC)|(?=ep2d_diff_tra_DYNDIST_ADC)|(?=ep2d_diff_tra_DYNDIST_MIX_ADC)|(?=ep2d_diff_tra2x2_Noise0_FS_DYNDIST_ADC)|(?=ep2d-advdiff-3Scan-4bval_spair_511b_ADC)|(?=ddep2d_diff_ADC)|(?=AX DWI_diff_b50- b500-b1000-b1800_ADC)|(?=ep2d_diff_zoomit_b50_500_1000_1800_tra_ADC)|(?=dReg - dwi_zoom_b0_500_1000_ADC))"
-            }
-        },
-        {
-            "name": "adc",
-            "conditions":
-            {
-                "Modality": "MR",
-                "SeriesDescription": "((?=ddep2d_diff_ADC)|(?=AX DWI_diff_b50- b500-b1000-b1800_ADC)|(?=ep2d_diff_zoomit_b50_500_1000_1800_tra_ADC)|(?=dReg - dwi_zoom_b0_500_1000_ADC))"
+                "SeriesDescription": "^(?!.*(?:localizer|survey))(?=.*adc).*"
             }
         }
     ]
@@ -133,19 +220,7 @@ Rules_HIGHB = """
             "conditions" :
             {
                 "Modality": "MR",
-                "ImageType": [
-                            "DIFFUSION",
-                            "TRACEW"
-                        ],
-                "SeriesDescription": "((?=3B 2000 w ERC SSh_DWI)|(?=AX DIFFUSION_CALC_BVAL_DFC_MIX)|(?=AX DWI)|(?=.*AX DWI (50,1500).*)|(?=Ax DWI BH)|(?=AX DWI_TRACEW_DFC_MIX)|(?=Axial FOCUS DWI 1400)|(?=b_1500 prostate)|(?=b_2000 prostate)|(?=DIFF bv1400)|(?=diff tra b 50 500 800 WIP511b alle spoelenCALC_BVAL)|(?=diffusie-3Scan-4bval_fsCALC_BVAL)|(?=DW_Synthetic: Ax DWI All B-50-800 Synthetic B-1400)|(?=.*DW_Synthetic: Ax Focus 50,500,800,1400,2000.*)|(?=DWI PROSTATE)|(?=DWI_5b_0_1500)|(?=DWI_b2000)|(?=DWI_b2000_new)|(?=DWI_b2000_new SENSE)|(?=DWI_b2000_NSA6 SENSE)|(?=ep2d_diff_b1400_new 32 measipat)|(?=ep2d_diff_tra_DYNDIST_MIXCALC_BVAL$)|(?=ep2d_diff_tra_DYNDISTCALC_BVAL)|(?=ep2d_diff_tra2x2_Noise0_FS_DYNDISTCALC_BVAL)|(?=ep2d-advdiff-3Scan-high bvalue 1400)|(?=sb_1500)|(?=sb_2000)|(?=sB1400)|(?=sb1500)|(?=sb-1500)|(?=sb1500 r5 only)|(?=sb-2000)|(?=sDWI_b_2000)|(?=sDWI_b2000)|(?=dep2d_diff_3scan_trace_RL)|(?=AX DWI_diff_b50- b500-b1000-b1800_TRACEW)|(?=ep2d_diff_zoomit_b50_500_1000_1800_tra_TRACEW)|(?=dwi_zoom_b0_500_1000)|(?=dwi_zoom_b1800))"
-            }
-        },
-        {
-            "name": "highb",
-            "conditions" :
-            {
-                "Modality": "MR",
-                "SeriesDescription": "((?=dep2d_diff_3scan_trace_RL)|(?=AX DWI_diff_b50- b500-b1000-b1800_TRACEW)|(?=ep2d_diff_zoomit_b50_500_1000_1800_tra_TRACEW)|(?=dwi_zoom_b0_500_1000)|(?=dwi_zoom_b1800))"
+                "SeriesDescription": "^(?!.*adc)(?!.*(?:localizer|survey))(?:(?=.*tracew?)|(?=.*dwi)|(?=.*diff)|(?=.*calc)|(?=.*compute[dr]?)|(?=.*(?:focus|muse).*b[0-9])).*"
             }
         }
     ]

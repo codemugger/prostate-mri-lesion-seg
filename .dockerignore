@@ -1,0 +1,37 @@
+# ---- Large data (volume-mounted at runtime, NOT baked into image) ----
+models/
+prostate_mri_lesion_seg_app/models/
+test-data/
+output/
+output_beta/
+
+# ---- Git / repo metadata ----
+.git/
+.gitignore
+
+# ---- Training / experiment artefacts ----
+notebooks/
+training/
+configs/
+data/
+data_backup/
+experiments/
+PROSTATEx_masks/
+ORIGINAL prostate-mri-lesion-seg REFERENCE/
+
+# ---- Documentation / images (not needed inside container) ----
+imgs/
+*.md
+LICENSE
+NOTE TO SELF.txt
+
+# ---- Jupyter notebooks ----
+*.ipynb
+
+# ---- Compiled Python ----
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- Docker build artefacts ----
+docker/docker_image.tar

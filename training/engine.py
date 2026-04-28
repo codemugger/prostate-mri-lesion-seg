@@ -230,7 +230,7 @@ def validate(model, loader, device, inferer, post_pred, post_label, include_back
     
     dice_metric.reset()
     return mean_dice
-def train_organ_from_config(config_path: str) -> TrainArtifacts:
+def train_organ_from_config(config_path: str, pretrained_path: str = None) -> TrainArtifacts:
     cfg = load_yaml(config_path)
 
     # Determinism
@@ -291,6 +291,21 @@ def train_organ_from_config(config_path: str) -> TrainArtifacts:
 
     # Model / loss / optimizer / scheduler
     model = build_model(cfg).to(device)
+
+    if pretrained_path is not None:
+        if not os.path.isfile(pretrained_path):
+            raise FileNotFoundError(f"Pretrained weights not found: {pretrained_path}")
+        if pretrained_path.endswith(".ts"):
+            ts_model = torch.jit.load(pretrained_path, map_location=device)
+            model.load_state_dict(ts_model.state_dict())
+            del ts_model
+        else:
+            ckpt = torch.load(pretrained_path, map_location=device)
+            state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+            model.load_state_dict(state_dict)
+            del ckpt
+        print(f"Loaded pretrained weights from: {pretrained_path}")
+
     loss_fn = get_loss(cfg["loss"])
     optimizer = build_optimizer(cfg, model)
     scheduler = build_scheduler(cfg, optimizer)

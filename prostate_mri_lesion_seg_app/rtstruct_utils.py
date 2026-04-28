@@ -61,6 +61,7 @@ import numpy as np
 import nibabel as nib
 from pathlib import Path
 from scipy import ndimage as ndi
+from scipy.ndimage import zoom as scipy_zoom
 from typing import Optional
 
 try:
@@ -126,24 +127,44 @@ def _ensure_study_id(dicom_series_path: str) -> tuple[str, Optional[tempfile.Tem
 def _prepare_mask_from_array(label_data: np.ndarray) -> np.ndarray:
     """
     Convert a label array into a boolean mask suitable for rt_utils:
+    - Promote 2D to 3D if needed
     - Fill holes
     - Transpose (x, y, z) -> (y, x, z)
     """
     mask = label_data.astype(bool)
+    if mask.ndim == 2:
+        mask = mask[..., np.newaxis]
     if mask.ndim != 3:
-        raise ValueError(f"Expected 3D mask, got shape {mask.shape}")
+        raise ValueError(f"Expected 2D or 3D mask, got shape {label_data.shape}")
 
-    # Fill holes slice-wise in 3D
     mask = ndi.binary_fill_holes(mask)
 
     # Nibabel gives (x, y, z); rt_utils expects (rows, cols, slices) on last axis
     mask = np.transpose(mask, (1, 0, 2))  # (x,y,z) -> (y,x,z)
 
-    # RAS (NIfTI) -> LPS (DICOM): flip row axis if needed.
-    # For now no need to flip, because the DICOM series is already in LPS orientation.
-    # mask = mask[::-1, :, :]
-
     return mask  # bool, 3D
+
+
+def _match_mask_to_dicom_slices(mask: np.ndarray, num_dicom_slices: int) -> np.ndarray:
+    """
+    Resize the mask's z-dimension (last axis) to match the DICOM series slice
+    count using nearest-neighbor interpolation.
+
+    MONAI's DICOMSeriesToVolumeOperator may remove duplicate/problematic DICOM
+    slices during volume conversion, so the NIfTI mask can have fewer slices
+    than the number of .dcm files on disk.  rt_utils requires an exact match.
+    """
+    mask_slices = mask.shape[-1]
+    if mask_slices == num_dicom_slices:
+        return mask
+
+    logging.warning(
+        "Mask z-dim (%d) != DICOM slice count (%d). "
+        "Resampling mask to match DICOM series.",
+        mask_slices, num_dicom_slices,
+    )
+    zoom_factors = [1.0] * (mask.ndim - 1) + [num_dicom_slices / mask_slices]
+    return scipy_zoom(mask.astype(np.float32), zoom_factors, order=0) > 0.5
 
 
 def load_nifti_mask(nifti_path: str) -> np.ndarray:
@@ -164,59 +185,98 @@ def load_nifti_mask(nifti_path: str) -> np.ndarray:
     return _prepare_mask_from_array(data > 0)
 
 
-def find_t2_dicom_series_path(input_path: Path) -> Optional[Path]:
+def find_dicom_series_by_uid(input_path: Path, series_instance_uid: str) -> Optional[Path]:
+    """
+    Find the DICOM series folder whose files have the given SeriesInstanceUID.
+
+    Walks *input_path* recursively; for every directory that contains ``.dcm``
+    files, reads one file header and compares ``SeriesInstanceUID``.
+
+    Returns the matching directory ``Path``, or ``None``.
+    """
+    import pydicom
+
+    input_path = Path(input_path)
+    if not input_path.exists():
+        return None
+
+    for root, _dirs, files in os.walk(input_path):
+        dcm_files = [f for f in files if f.lower().endswith(".dcm") and ":" not in f]
+        if not dcm_files:
+            continue
+        sample = os.path.join(root, dcm_files[0])
+        try:
+            ds = pydicom.dcmread(sample, stop_before_pixels=True, force=True)
+            if str(getattr(ds, "SeriesInstanceUID", "")) == series_instance_uid:
+                return Path(root)
+        except Exception:
+            continue
+
+    return None
+
+
+def find_t2_dicom_series_path(
+    input_path: Path,
+    series_instance_uid: Optional[str] = None,
+) -> Optional[Path]:
     """
     Find the T2 DICOM series folder from the input path.
 
-    Uses name heuristics consistent with the ProstateX data and Rules_T2.
+    If *series_instance_uid* is provided the folder is located by reading one
+    DICOM header per subdirectory and matching UIDs exactly.  This is the
+    preferred path because it guarantees the RTSTRUCT references the same
+    series that the pipeline actually used for inference.
+
+    Falls back to name-based heuristics only when no UID is supplied.
     """
     input_path = Path(input_path)
+
+    if series_instance_uid:
+        matched = find_dicom_series_by_uid(input_path, series_instance_uid)
+        if matched is not None:
+            logging.info("T2 DICOM series matched by UID: %s", matched)
+            return matched
+        logging.warning(
+            "Could not find T2 folder by SeriesInstanceUID %s — "
+            "falling back to name heuristics.",
+            series_instance_uid,
+        )
 
     if not input_path.exists():
         return None
 
-    # Common T2 series folder name patterns (from app.py Rules_T2 and notebook example)
-    # The notebook uses: "5.000000-t2tsetra-75680"
     t2_patterns = [
         "t2tse",
         "t2_tse",
         "t2tsetra",
         "t2_tse_tra",
-        "t2tsecor",
-        "t2tsesag",
         "T2",
         "T2W",
         "T2W_TSE",
         "AX T2",
         "T2 AX",
         "T2 TSE",
-        "t2_tse",
     ]
 
-    # Search recursively for T2 series folders
     found_paths: list[tuple[Path, int]] = []
 
     for root, _dirs, _files in os.walk(input_path):
         root_path = Path(root)
         dir_name = root_path.name.lower()
 
-        # Check if directory name contains T2 pattern
         for pattern in t2_patterns:
             if pattern.lower() in dir_name:
                 dicom_files = list(root_path.glob("*.dcm")) + list(root_path.glob("*.DCM"))
                 if len(dicom_files) > 0:
-                    # Prefer "tra" (transverse) T2 series as it's most common for prostate
                     if "tra" in dir_name or "t2tsetra" in dir_name:
                         return root_path
                     found_paths.append((root_path, len(dicom_files)))
                     break
 
-    # If we found T2 folders, return the one with most DICOM files
     if found_paths:
         found_paths.sort(key=lambda x: x[1], reverse=True)
         return found_paths[0][0]
 
-    # Fallback: any directory with several DICOM slices
     for root, _dirs, _files in os.walk(input_path):
         root_path = Path(root)
         dicom_files = list(root_path.glob("*.dcm")) + list(root_path.glob("*.DCM"))
@@ -249,8 +309,12 @@ def create_rtstruct_from_mask(
     patched_path, tmpdir = _ensure_study_id(dicom_series_path)
     try:
         rtstruct = RTStructBuilder.create_new(dicom_series_path=patched_path)
+        num_dicom_slices = len(rtstruct.series_data)
 
         numpy_segmentation_mask = load_nifti_mask(nifti_mask_path)
+        numpy_segmentation_mask = _match_mask_to_dicom_slices(
+            numpy_segmentation_mask, num_dicom_slices
+        )
 
         rtstruct.add_roi(
             mask=numpy_segmentation_mask,
@@ -270,19 +334,27 @@ def generate_rtstruct_files(
     output_folder: Path,
     input_folder: Path,
     t2_dicom_series_path: Optional[Path] = None,
+    t2_series_instance_uid: Optional[str] = None,
 ) -> dict:
     """
     Generate RTSTRUCT files for both organ and lesion segmentations.
 
     - Organ:  organ/organ.nii.gz   -> organ_RTSTRUCT.dcm
     - Lesion: lesion/lesion_mask.nii.gz -> lesion_RTSTRUCT.dcm
+
+    *t2_series_instance_uid* (preferred): the DICOM SeriesInstanceUID of the
+    T2 series that the pipeline selected.  When provided, the function locates
+    the correct DICOM folder by UID, guaranteeing that the RTSTRUCT references
+    the same series the viewer will display.
     """
     output_folder = Path(output_folder)
     input_folder = Path(input_folder)
 
     # Find T2 DICOM series path if not provided
     if t2_dicom_series_path is None:
-        t2_dicom_series_path = find_t2_dicom_series_path(input_folder)
+        t2_dicom_series_path = find_t2_dicom_series_path(
+            input_folder, series_instance_uid=t2_series_instance_uid,
+        )
         if t2_dicom_series_path is None:
             raise ValueError(
                 f"Could not find T2 DICOM series folder in: {input_folder}. "
@@ -304,40 +376,53 @@ def generate_rtstruct_files(
     if organ_nifti_path.exists():
         organ_rtstruct_path = output_folder / "organ" / "organ_RTSTRUCT.dcm"
         try:
-            # Load multi-class organ mask (0=bg, 1=TZ, 2=PZ) and create:
-            # - Whole prostate ROI (TZ+PZ)
-            # - TZ ROI (label==1)
-            # - PZ ROI (label==2)
             nii = nib.load(str(organ_nifti_path))
             data = nii.get_fdata()
-
-            whole_mask = _prepare_mask_from_array(data > 0)
-            tz_mask = _prepare_mask_from_array(data == 1)
-            pz_mask = _prepare_mask_from_array(data == 2)
+            max_label = int(data.max())
 
             patched_path, tmpdir = _ensure_study_id(str(t2_dicom_series_path))
             try:
                 rtstruct = RTStructBuilder.create_new(dicom_series_path=patched_path)
+                num_dicom_slices = len(rtstruct.series_data)
 
-                if tz_mask.any():
-                    rtstruct.add_roi(
-                        mask=tz_mask,
-                        name="Prostate_TZ",
-                        color=[0, 0, 255],
-                        use_pin_hole=True,
-                    )
+                if max_label >= 2:
+                    # Multi-class organ mask (0=bg, 1=TZ, 2=PZ)
+                    tz_mask = _prepare_mask_from_array(data == 1)
+                    pz_mask = _prepare_mask_from_array(data == 2)
+                    tz_mask = _match_mask_to_dicom_slices(tz_mask, num_dicom_slices)
+                    pz_mask = _match_mask_to_dicom_slices(pz_mask, num_dicom_slices)
 
-                if pz_mask.any():
-                    rtstruct.add_roi(
-                        mask=pz_mask,
-                        name="Prostate_PZ",
-                        color=[255, 255, 0],
-                        use_pin_hole=True,
-                    )
+                    if tz_mask.any():
+                        rtstruct.add_roi(
+                            mask=tz_mask,
+                            name="Prostate_TZ",
+                            color=[0, 0, 255],
+                            use_pin_hole=True,
+                        )
+
+                    if pz_mask.any():
+                        rtstruct.add_roi(
+                            mask=pz_mask,
+                            name="Prostate_PZ",
+                            color=[255, 255, 0],
+                            use_pin_hole=True,
+                        )
+                    logging.info("Organ RTSTRUCT created (multi-class): %s", organ_rtstruct_path)
+                else:
+                    # Binary organ mask (0=bg, 1=prostate)
+                    whole_mask = _prepare_mask_from_array(data > 0)
+                    whole_mask = _match_mask_to_dicom_slices(whole_mask, num_dicom_slices)
+                    if whole_mask.any():
+                        rtstruct.add_roi(
+                            mask=whole_mask,
+                            name="Prostate",
+                            color=[0, 255, 0],
+                            use_pin_hole=True,
+                        )
+                    logging.info("Organ RTSTRUCT created (binary): %s", organ_rtstruct_path)
 
                 rtstruct.save(str(organ_rtstruct_path))
                 results["organ_rtstruct"] = str(organ_rtstruct_path)
-                logging.info("Organ RTSTRUCT created (multi-class): %s", organ_rtstruct_path)
             finally:
                 if tmpdir is not None:
                     tmpdir.cleanup()

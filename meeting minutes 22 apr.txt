@@ -1,0 +1,21 @@
+- prostate segmentation
+- lesion segmentation 
+- pi-rads classifier 
+- robotic software that will be helpful 
+- machine being used across hospitals 
+- AI in-house development models 
+
+
+- edit on a viewer 
+- view the contour on platform
+
+
+map contour on T2 only (reminder) 
+
+
+Dicom segmentation vs RTSTRUCT 
+--> iN THE NEXT MONTH OF TWO, DICOM Segmentation can be viewed in 3D. 
+--> when accepted can be RTSTRUCT 
+--> ohif viewer have native support for RTSTRUCT 
+--> what are the 2500 commonalities , patients have a bmi of certain number, race or any attributes 
+

@@ -192,7 +192,7 @@ class ProstateSegOperator(Operator):
                     to_tensor=True,
                 ),
                 DataStatsd(keys=pred_key, name="Inverted output"),
-                AsDiscreted(keys=pred_key, argmax=True, threshold=None),
+                AsDiscreted(keys=pred_key, argmax=True, threshold=0.5),
                 DataStatsd(keys=pred_key, name="AsDiscrete output")
             ]
         )

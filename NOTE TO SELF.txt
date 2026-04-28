@@ -1,19 +1,13 @@
-THIS IS THE PROSTATE MONAI APP (NVIDIA/NIH VERSION) 11 DEC 2025 0946H:
+19 March 2026 Meeting with Anh: 
 
-NOTE TO SELF FOR 10 DEC 2025 AND BEFORE:
-- Inference for APP works, but prostate segmentation remains only SINGLE CLASS (Whole prostate rather than multi-class) 
-- Validation inference for app completely works in the notebook directory, prostate segmentation is MULTI-CLASS (BG, TZ, PZ) 
-- RTSTRUCT workable for inference for APP ONLY 
-- Training for lesion pipeline created but not confirmed yet 
-- BATCH Inference for APP works 
+1. Edit the excel sheet for exhaustively list for dicom slices. -> find unique slices  
+2. Another algo to aggregate the list to get two things 
+- count in terms of series 
+- count of subfolders in one ascension number 
+3. rename for new folders of Dicom
 
-NOTE TO SELF AFTER 11 DEC 0946H:
-- App now successfully generates MULTI-CLASS Prostate Segmentation, showing the P-TZONE and T-ZONE 
-- README has been updated to reflect the latest pipelines and app features
-- Pending 
+contour - maybe we do ourselves - upload to CARPL - clinicians need review
+- turn off anonymisation first since its already dealing with anonymised 
+- viewer can change to survey (we do ingestion first)
 
-NOTE TO SELF AFTER 15 DEC 1316H:
-- We begin with lesion training, current DICE score only 0.2. 
-- We try to modify lesion training pipeline and config, and integrate p158 practices
-- To bear in mind of the existing monai app pipeline and not configure too much 
 
