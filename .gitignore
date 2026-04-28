@@ -20,3 +20,38 @@ output_beta/
 /PROSTATEx_masks
 /ORIGINAL prostate-mri-lesion-seg REFERENCE
 
+# Docker image exports and archives
+/docker/*.tar
+*.tar
+*.tar.gz
+*.tgz
+
+# Generated inference/export outputs
+/output_for_anh/
+*/dicom/
+
+# Medical imaging data and masks
+*.dcm
+*.dicom
+*.nii
+*.nii.gz
+*.nrrd
+*.mha
+*.mhd
+
+# Model weights and training checkpoints
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.pkl
+*.joblib
+
+# Python/Jupyter generated files
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Windows alternate data stream metadata
+*:Zone.Identifier
+
