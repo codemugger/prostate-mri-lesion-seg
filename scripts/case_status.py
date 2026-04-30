@@ -65,6 +65,7 @@ EXPECTED_FILES: "dict[str, str]" = {
     "lesion_rtstruct":     "lesion/lesion_RTSTRUCT.dcm",
     "merged_lesion_prob":  "lesion/merged_lesion_prob.nii.gz",
     "lesions_txt":         "lesions.txt",
+    "combined_rtstruct":   "combined_organ_lesion_RTSTRUCT.dcm",
 }
 
 # All five fold probability maps must exist for SUCCESS_COMPLETE.
@@ -90,6 +91,7 @@ CSV_COLUMNS: "list[str]" = [
     "has_merged_lesion_prob",
     "has_lesion_folds",
     "has_lesions_txt",
+    "has_combined_rtstruct",
     "output_file_count",
     "input_dir",
     "output_dir",

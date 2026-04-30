@@ -337,10 +337,11 @@ def generate_rtstruct_files(
     t2_series_instance_uid: Optional[str] = None,
 ) -> dict:
     """
-    Generate RTSTRUCT files for both organ and lesion segmentations.
+    Generate RTSTRUCT files for organ, lesion, and combined segmentations.
 
-    - Organ:  organ/organ.nii.gz   -> organ_RTSTRUCT.dcm
-    - Lesion: lesion/lesion_mask.nii.gz -> lesion_RTSTRUCT.dcm
+    - Organ:    organ/organ.nii.gz       -> organ/organ_RTSTRUCT.dcm
+    - Lesion:   lesion/lesion_mask.nii.gz -> lesion/lesion_RTSTRUCT.dcm
+    - Combined: both masks               -> combined_organ_lesion_RTSTRUCT.dcm
 
     *t2_series_instance_uid* (preferred): the DICOM SeriesInstanceUID of the
     T2 series that the pipeline selected.  When provided, the function locates
@@ -368,6 +369,7 @@ def generate_rtstruct_files(
     results: dict[str, Optional[str]] = {
         "organ_rtstruct": None,
         "lesion_rtstruct": None,
+        "combined_rtstruct": None,
         "t2_dicom_series": str(t2_dicom_series_path),
     }
 
@@ -457,6 +459,67 @@ def generate_rtstruct_files(
             lesion_nifti_path,
         )
 
+    # ---- Combined Organ + Lesion RTSTRUCT ----
+    # Single RTSTRUCT containing all organ and lesion ROIs together, placed in
+    # the case root so viewers like CARPL can load one file with every contour.
+    if organ_nifti_path.exists() and lesion_nifti_path.exists():
+        combined_rtstruct_path = output_folder / "combined_organ_lesion_RTSTRUCT.dcm"
+        try:
+            patched_path, tmpdir = _ensure_study_id(str(t2_dicom_series_path))
+            try:
+                rtstruct = RTStructBuilder.create_new(dicom_series_path=patched_path)
+                num_dicom_slices = len(rtstruct.series_data)
+
+                organ_nii = nib.load(str(organ_nifti_path))
+                organ_data = organ_nii.get_fdata()
+                organ_max_label = int(organ_data.max())
+
+                if organ_max_label >= 2:
+                    tz_mask = _prepare_mask_from_array(organ_data == 1)
+                    pz_mask = _prepare_mask_from_array(organ_data == 2)
+                    tz_mask = _match_mask_to_dicom_slices(tz_mask, num_dicom_slices)
+                    pz_mask = _match_mask_to_dicom_slices(pz_mask, num_dicom_slices)
+                    if tz_mask.any():
+                        rtstruct.add_roi(
+                            mask=tz_mask, name="Prostate_TZ",
+                            color=[0, 0, 255], use_pin_hole=True,
+                        )
+                    if pz_mask.any():
+                        rtstruct.add_roi(
+                            mask=pz_mask, name="Prostate_PZ",
+                            color=[255, 255, 0], use_pin_hole=True,
+                        )
+                else:
+                    whole_mask = _prepare_mask_from_array(organ_data > 0)
+                    whole_mask = _match_mask_to_dicom_slices(whole_mask, num_dicom_slices)
+                    if whole_mask.any():
+                        rtstruct.add_roi(
+                            mask=whole_mask, name="Prostate",
+                            color=[0, 255, 0], use_pin_hole=True,
+                        )
+
+                lesion_mask = load_nifti_mask(str(lesion_nifti_path))
+                lesion_mask = _match_mask_to_dicom_slices(lesion_mask, num_dicom_slices)
+                if lesion_mask.any():
+                    rtstruct.add_roi(
+                        mask=lesion_mask, name="Lesion",
+                        color=[255, 0, 0], use_pin_hole=True,
+                    )
+
+                rtstruct.save(str(combined_rtstruct_path))
+                results["combined_rtstruct"] = str(combined_rtstruct_path)
+                logging.info("Combined organ+lesion RTSTRUCT created: %s", combined_rtstruct_path)
+            finally:
+                if tmpdir is not None:
+                    tmpdir.cleanup()
+        except Exception as exc:
+            logging.error("Failed to create combined RTSTRUCT: %s", exc)
+    else:
+        logging.warning(
+            "Skipping combined RTSTRUCT: organ NIfTI exists=%s, lesion NIfTI exists=%s",
+            organ_nifti_path.exists(), lesion_nifti_path.exists(),
+        )
+
     return results
 
 
@@ -502,6 +565,7 @@ if __name__ == "__main__":  # pragma: no cover - CLI helper
     print(f"  T2 DICOM Series: {res['t2_dicom_series']}")
     print(f"  Organ RTSTRUCT: {res['organ_rtstruct']}")
     print(f"  Lesion RTSTRUCT: {res['lesion_rtstruct']}")
+    print(f"  Combined RTSTRUCT: {res['combined_rtstruct']}")
 
 
 

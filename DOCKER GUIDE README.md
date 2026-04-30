@@ -315,7 +315,8 @@ output/
 │   ├── t2/
 │   ├── adc/
 │   └── highb/
-└── lesions.txt                         # PI-RADS report (YAML)
+├── lesions.txt                         # PI-RADS report (YAML)
+└── combined_organ_lesion_RTSTRUCT.dcm  # Combined organ + lesion RT Structure Set
 ```
 
 ---
