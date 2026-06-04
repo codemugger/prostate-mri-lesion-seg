@@ -1,0 +1,7 @@
+- Major_Axis_Length: 294.0446744665446
+  Organ: Prostate
+  Volume: 24223.125
+- Lesion_ID: 1
+  Major_Axis_Length: 9.206952307798982
+  PI_RADS: 4
+  Volume: 117.125
