@@ -10,7 +10,9 @@ output_beta/
 /p158-inspiration
 /data_backup
 @docker/docker_image.tar
-
+/output_delta 
+/output_echo
+/output*
 
 
 # Windows / macOS metadata files (often appear after copying/unzipping datasets)

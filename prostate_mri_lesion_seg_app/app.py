@@ -70,6 +70,7 @@ from monai.deploy.operators.dicom_series_to_volume_operator import DICOMSeriesTo
 from organ_seg_operator import ProstateSegOperator
 from custom_lesion_seg_operator import ProstateLesionSegOperator
 from custom_lesion_classifier_operator import ProstateLesionClassifierOperator
+from highb_filter_operator import HighBValueFilterOperator
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +263,7 @@ class AIProstateLesionSegApp(Application):
         series_selector_ADC_op = DICOMSeriesSelectorOperator(self, rules=Rules_ADC, name="series_selector_ADC")
         series_to_vol_ADC_op = DICOMSeriesToVolumeOperator(self, name="series_to_vol_ADC")
         series_selector_HIGHB_op = DICOMSeriesSelectorOperator(self, rules=Rules_HIGHB, name="series_selector_HIGHB")
+        highb_bvalue_filter_op = HighBValueFilterOperator(self, name="highb_bvalue_filter")
         series_to_vol_HIGHB_op = DICOMSeriesToVolumeOperator(self, name="series_to_vol_HIGHB")
 
         # AI operators
@@ -298,7 +300,8 @@ class AIProstateLesionSegApp(Application):
         self.add_flow(study_loader_op, series_selector_HIGHB_op, {("dicom_study_list", "dicom_study_list")})
         self.add_flow(series_selector_T2_op, series_to_vol_T2_op, {("study_selected_series_list", "study_selected_series_list")})
         self.add_flow(series_selector_ADC_op, series_to_vol_ADC_op, {("study_selected_series_list", "study_selected_series_list")})
-        self.add_flow(series_selector_HIGHB_op, series_to_vol_HIGHB_op, {("study_selected_series_list", "study_selected_series_list")})
+        self.add_flow(series_selector_HIGHB_op, highb_bvalue_filter_op, {("study_selected_series_list", "study_selected_series_list")})
+        self.add_flow(highb_bvalue_filter_op, series_to_vol_HIGHB_op, {("study_selected_series_list", "study_selected_series_list")})
 
         # Organ inference
         self.add_flow(series_to_vol_T2_op, organ_seg_op, {("image", "image")})

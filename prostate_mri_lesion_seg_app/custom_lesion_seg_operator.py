@@ -464,6 +464,10 @@ class ProstateLesionSegOperator(Operator):
         Each *images* value is a MONAI Image whose metadata contains
         ``SeriesInstanceUID``.  The matching folder in *input_path* is located
         by UID and its ``.dcm`` files are copied.
+
+        For the ``highb`` label, only DICOM files at the **highest b-value**
+        are copied (matching the filtering done by
+        :class:`highb_filter_operator.HighBValueFilterOperator`).
         """
         import shutil
 
@@ -478,34 +482,94 @@ class ProstateLesionSegOperator(Operator):
             dst_dir = output_path / "dicom" / label
             dst_dir.mkdir(parents=True, exist_ok=True)
 
-            if uid in copied_uids:
-                src_already = copied_uids[uid]
-                self.logger.info(
-                    "DICOM copy: %s shares SeriesInstanceUID with %s — symlinking.",
-                    label, src_already,
-                )
-                already_dir = output_path / "dicom" / src_already
-                for f in already_dir.iterdir():
-                    target = dst_dir / f.name
-                    if not target.exists():
-                        shutil.copy2(str(f), str(target))
-                continue
-
             src_dir = find_dicom_series_by_uid(input_path, uid)
             if src_dir is None:
+                if uid in copied_uids:
+                    src_already = copied_uids[uid]
+                    self.logger.info(
+                        "DICOM copy: %s shares SeriesInstanceUID with %s — copying from existing.",
+                        label, src_already,
+                    )
+                    already_dir = output_path / "dicom" / src_already
+                    for f in already_dir.iterdir():
+                        target = dst_dir / f.name
+                        if not target.exists():
+                            shutil.copy2(str(f), str(target))
+                    continue
                 self.logger.warning(
                     "DICOM copy: could not find folder for %s UID %s", label, uid,
                 )
                 continue
 
-            count = 0
-            for f in src_dir.iterdir():
-                if f.is_file() and f.suffix.lower() == ".dcm" and ":" not in f.name:
-                    shutil.copy2(str(f), str(dst_dir / f.name))
-                    count += 1
+            if label == "highb":
+                count = self._copy_highest_bvalue_dicoms(src_dir, dst_dir)
+            else:
+                count = 0
+                for f in src_dir.iterdir():
+                    if f.is_file() and f.suffix.lower() == ".dcm" and ":" not in f.name:
+                        shutil.copy2(str(f), str(dst_dir / f.name))
+                        count += 1
 
             self.logger.info("DICOM copy: %s — %d files from %s", label, count, src_dir.name)
             copied_uids[uid] = label
+
+    def _copy_highest_bvalue_dicoms(self, src_dir: Path, dst_dir: Path) -> int:
+        """Copy only the highest-b-value DICOM files from *src_dir* to *dst_dir*.
+
+        Uses the same b-value extraction logic as
+        :func:`highb_filter_operator.get_dicom_bvalue` (standard tag first,
+        Siemens private tag fallback).  If no b-values are found, all files
+        are copied (safe fallback).
+        """
+        import shutil
+        from highb_filter_operator import get_dicom_bvalue
+        import pydicom
+
+        dcm_files = [
+            f for f in src_dir.iterdir()
+            if f.is_file() and f.suffix.lower() == ".dcm" and ":" not in f.name
+        ]
+
+        file_bvalues: dict[Path, "float | None"] = {}
+        for f in dcm_files:
+            try:
+                ds = pydicom.dcmread(str(f), stop_before_pixels=True)
+                file_bvalues[f] = get_dicom_bvalue(ds)
+            except Exception:
+                file_bvalues[f] = None
+
+        known = {v for v in file_bvalues.values() if v is not None}
+
+        if len(known) <= 1:
+            count = 0
+            for f in dcm_files:
+                shutil.copy2(str(f), str(dst_dir / f.name))
+                count += 1
+            if known:
+                self.logger.info(
+                    "DICOM copy (highb): single b-value b=%.0f, copied all %d files.",
+                    next(iter(known)), count,
+                )
+            else:
+                self.logger.info(
+                    "DICOM copy (highb): no b-value tags, copied all %d files.", count,
+                )
+            return count
+
+        max_bval = max(known)
+        discarded = sorted(known - {max_bval})
+        count = 0
+        for f, bval in file_bvalues.items():
+            if bval == max_bval:
+                shutil.copy2(str(f), str(dst_dir / f.name))
+                count += 1
+
+        self.logger.info(
+            "DICOM copy (highb): copied %d/%d files at b=%.0f "
+            "(discarded b-values: %s)",
+            count, len(dcm_files), max_bval, discarded,
+        )
+        return count
 
     def convert_and_save(self, image1, image2, image3, organ_mask, output_path):
         """Converts and saves the input Images on disk in nii.gz format."""
