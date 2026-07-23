@@ -13,7 +13,7 @@ output_beta/
 /output_delta 
 /output_echo
 /output*
-
+/Interesting outputs
 
 # Windows / macOS metadata files (often appear after copying/unzipping datasets)
 .Identifier
@@ -60,3 +60,4 @@ __pycache__/
 Dr Anh's gemini ai prompt to investigate and consider implementing if feasible.pdf
 .gitignore
 Dr Anh's request for help July 2026.docx
+audit_assignments.csv

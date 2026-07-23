@@ -6,7 +6,7 @@
 
 This application ingests multi-parametric prostate MRI DICOM studies (T2-weighted, ADC, and high b-value images), segments the prostate organ and lesions, and classifies detected lesions into PI‑RADS categories. It is implemented as a MONAI Deploy DAG with dedicated operators for ingestion, preprocessing, inference, and reporting.
 
-This workflow takes T2, ADC, and HighB MRI series as input and produces several NIfTI files as output. These outputs contain organ and lesion segmentations and lesion probability maps.
+This workflow takes T2, ADC, and HighB MRI series as input and produces several NIfTI files, DICOM RT Structure Sets (RTSTRUCTs), and a classification report as output. These outputs contain organ and lesion segmentations, lesion probability maps, and per-lesion PI‑RADS scores. A combined RTSTRUCT merging organ zones and lesion contours into a single file is also generated for convenient viewing in clinical DICOM viewers.
 
 <p float="left">
   <img src="imgs/anson_organ_seg.png" width="400" height="300" />
@@ -20,7 +20,8 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
   - T2-weighted (T2)
   - Diffusion-derived ADC map (ADC)
   - High b‑value diffusion (HIGHB)
-- Series auto-selection is done via curated regex rules on DICOM tags (Modality, ImageType, SeriesDescription). The app expects ProstateX-like naming but is robust across common site conventions.
+- Series auto-selection is done via curated regex rules on DICOM tags (Modality, SeriesDescription). The rules were derived from Dr. Anh Tuan Doan's manual annotation of ~3,500 SGH cases and validated at 100 % precision / 100 % recall on 43,470 annotated rows (see `scripts/validate_selection_rules.py`). The rules work with ProstateX-style naming and are robust across common site conventions including SGH de-identified data.
+- For multi-b-value HIGHB series (e.g. `ep2d_diff_b50_500_1000_1800`), only the highest b‑value slices are retained automatically via the `HighBValueFilterOperator`.
 
 
 ## What comes out (Outputs)
@@ -37,15 +38,21 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
   - `output/lesion/lesion_mask.nii.gz` (binary mask, post-processed)
 - Lesion report with PI‑RADS and lesion statistics
   - `output/lesions.txt` (YAML: per-lesion PI‑RADS, major axis length, volume, plus organ stats)
-- RTSTRUCT files (DICOM RT Structure Set)
-  - `output/organ/organ.rtstruct.dcm`
-  - `output/lesion/lesion.rtstruct.dcm`
+- RTSTRUCT files (DICOM RT Structure Set), all referenced against the pipeline-selected T2 DICOM series
+  - `output/organ/organ_RTSTRUCT.dcm` — organ zones only (ROIs: `Prostate_TZ` blue, `Prostate_PZ` yellow; or `Prostate` green if binary)
+  - `output/lesion/lesion_RTSTRUCT.dcm` — lesion contours only (ROI: `Lesion` red)
+  - `output/combined_organ_lesion_RTSTRUCT.dcm` — **combined** organ zones + lesion contours in a single file for convenient loading in clinical viewers (e.g. CARPL)
+- Copies of the pipeline-selected DICOM series (for importing alongside RTSTRUCTs into a viewer)
+  - `output/dicom/t2/` — T2 DICOM files
+  - `output/dicom/adc/` — ADC DICOM files
+  - `output/dicom/highb/` — highest-b-value DICOM files only
 
 
 ## End-to-end pipeline (high level)
 
 1) **Data ingestion**
-- Load DICOM studies → select T2/ADC/HIGHB series using rules → convert each series to in‑memory 3D images with NIfTI metadata.
+- Load DICOM studies → select T2/ADC/HIGHB series using regex rules on SeriesDescription → convert each series to in‑memory 3D images with NIfTI metadata.
+- For multi-b-value HIGHB series, a `HighBValueFilterOperator` retains only the highest b‑value slices before volume conversion.
 
 2) **Organ segmentation (prostate)**
 - Preprocess T2: channel-first, RAS orientation, 1.0 mm isotropic resampling, intensity normalization.
@@ -53,12 +60,14 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
 - Save `output/organ/organ.nii.gz` as a multi-class mask (background/TZ/PZ).
 
 3) **Lesion segmentation (ensemble, organ-masked)**
+- If the organ mask is empty (no prostate detected), lesion inference is skipped and an all-zero `lesion_mask.nii.gz` is written.
 - Save T2/ADC/HIGHB/organ as NIfTI for reproducible preprocessing.
 - Align ADC/HIGHB to T2 geometry; resample all to 0.5 mm isotropic.
 - Compute ROI from the organ mask with a 32‑voxel margin and crop volumes to the ROI.
 - Run a 5‑fold 3D RR‑UNet ensemble on the ROI, accumulate and average per-voxel probabilities.
+- Parallel inference across all 5 folds using `ThreadPoolExecutor`.
 - Multiply merged probabilities by the organ mask (remove out-of-prostate predictions).
-- Threshold with a fixed value (0.6344772701607316) → `lesion_mask.nii.gz`.
+- Threshold with a fixed value (0.63) → `lesion_mask.nii.gz`.
 
 4) **Lesion classification (PI‑RADS)**
 - Resample T2/ADC/HIGHB/organ/lesion to 0.5 mm.
@@ -67,13 +76,31 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
 - Rule-based adjustment: if predicted=2 (PI‑RADS 4) and major axis length > 40 mm, upgrade to predicted=3 (PI‑RADS 5).
 - Write lesion and organ stats to `output/lesions.txt`.
 
+5) **RTSTRUCT generation and DICOM export**
+- Generate three DICOM RT Structure Sets from the NIfTI masks, all referenced against the pipeline-selected T2 DICOM series (matched by `SeriesInstanceUID`):
+  - `organ_RTSTRUCT.dcm` — organ zones (TZ/PZ or whole prostate).
+  - `lesion_RTSTRUCT.dcm` — lesion contour(s).
+  - `combined_organ_lesion_RTSTRUCT.dcm` — all organ + lesion ROIs in a single file.
+- Copy the pipeline-selected DICOM files for T2, ADC, and HIGHB into `output/dicom/` so radiologists can import DICOMs and RTSTRUCTs together into a viewer.
+
 
 ## Detailed components
 
 ### Data ingestion and series selection
 - Orchestrated by `prostate_mri_lesion_seg_app/app.py` using MONAI Deploy:
   - `DICOMDataLoaderOperator` → `DICOMSeriesSelectorOperator` (rules per modality) → `DICOMSeriesToVolumeOperator` (in‑memory images).
+  - For the HIGHB branch, a `HighBValueFilterOperator` is inserted between the selector and the volume converter to retain only the highest b‑value slices.
+- Selection rules are regex-based on `SeriesDescription` (case-insensitive). They were derived from Dr. Anh Tuan Doan's manual annotation of ~3,500 SGH de-identified cases and validated at 100 % precision / 100 % recall on 43,470 annotated rows via `scripts/validate_selection_rules.py`.
+- `ImageType` is intentionally not required in the rules because SGH data frequently lacks this field; the regex alone is strict enough to separate T2 / ADC / HIGHB.
 - The DAG wires T2/ADC/HIGHB into downstream operators (organ seg → lesion seg → classifier).
+- A monkeypatch on `DICOMSeriesToVolumeOperator.prepare_series` fixes two bugs with SGH de-identified DICOM data: (1) incorrect slice removal using `enumerate()` indices instead of actual indices, and (2) crash on missing `.distance` attributes after broken removal.
+
+### High b‑value filtering
+- Operator: `HighBValueFilterOperator` (`prostate_mri_lesion_seg_app/highb_filter_operator.py`)
+- Problem: SGH multi-b DWI series (e.g. `ep2d_diff_b50_500_1000_1800 prostate_TRACEW`) pack all b-value volumes into a single DICOM series. A 24-slice acquisition at 4 b-values produces 96 DICOM instances. Without filtering, `DICOMSeriesToVolumeOperator` stacks all instances into one 3-D volume whose slices alternate between b-values, producing a physically meaningless input for the lesion model.
+- Solution: reads each SOP instance's b-value (standard tag `(0018,9087)` first, Siemens private tag `(0019,100C)` as fallback), identifies the maximum b-value, and removes all instances that do not carry the maximum.
+- B-values are rounded to the nearest integer before comparison to handle floating-point storage (e.g. 1799.99 → 1800).
+- If no b-value tags are found (e.g. some GE sequences), the series passes through unmodified (safe default).
 
 ### Organ segmentation
 - Operator: `ProstateSegOperator` (`prostate_mri_lesion_seg_app/organ_seg_operator.py`)
@@ -84,14 +111,16 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
   - Model artifact: `models/organ/model.ts` (TorchScript).
   - Model loading: Operator looks for `model.ts` directly in the `model_path` directory.
 - Post-processing:
-  - Softmax → invert transforms → argmax with `threshold=None` → multi-class prostate mask (background/TZ/PZ) in original space.
-  - The `threshold=None` parameter is critical to preserve all three classes (0=background, 1=TZ, 2=PZ); using a threshold would collapse to binary.
+  - Softmax → invert transforms → `AsDiscreted(argmax=True)` → multi-class prostate mask (background/TZ/PZ) in original space.
+  - The `argmax=True` parameter is critical to preserve all three classes (0=background, 1=TZ, 2=PZ); using only a threshold without argmax would collapse to binary.
 
 ### Lesion segmentation (3D RR‑UNet ensemble, 5 folds)
 - Operator: `ProstateLesionSegOperator` (`prostate_mri_lesion_seg_app/custom_lesion_seg_operator.py`)
 - Inputs: T2, ADC, HIGHB, and organ mask (from Organ Seg).
+- **Empty organ guard**: if the organ mask is entirely zero (no prostate detected — common with very-thin SGH series of 1–6 slices), lesion inference is skipped entirely and an all-zero `lesion_mask.nii.gz` is written. This avoids meaningless full-volume inference.
 - Preprocessing:
   - Save all inputs as NIfTI under `output/`.
+  - Graceful affine fallback: `nifti_affine_transform` → `dicom_affine_transform` → identity matrix (handles SGH data with missing spatial metadata).
   - Resample ADC/HIGHB to match T2 geometry (SimpleITK), then resample all to 0.5 mm isotropic.
   - Compute a prostate-centered ROI using `organ.nii.gz`, with a 32‑voxel margin; crop the inputs to the ROI.
   - Per-channel z‑score normalization across `[T2, ADC, HIGHB]`.
@@ -101,10 +130,15 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
 - Inference:
   - Patch-based over the ROI with strides sized to multiples of 32; accumulate sums and counts per voxel, then average.
   - Reconstruct to original size and save per-fold probability maps; average to `merged_lesion_prob.nii.gz`.
-  - Parallel inference across all 5 folds using ThreadPoolExecutor.
+  - Parallel inference across all 5 folds using `ThreadPoolExecutor`.
 - Post-processing:
   - Multiply merged probabilities by the organ mask (removes non-prostate detections).
-  - Fixed threshold (0.6344772701607316) → `lesion_mask.nii.gz`.
+  - Fixed threshold (0.63) → `lesion_mask.nii.gz`.
+- RTSTRUCT and DICOM export (runs after lesion inference):
+  - Generates three RTSTRUCT files via `rtstruct_utils.generate_rtstruct_files()` — organ, lesion, and combined (see Outputs above).
+  - RTSTRUCTs are built from the exact T2 DICOM series the pipeline selected, matched by `SeriesInstanceUID` (not heuristic folder-name matching).
+  - SGH de-identified data often lacks the `StudyID` tag `(0020,0010)`, which crashes `rt_utils`. The code automatically patches `StudyID` from `AccessionNumber` in a temporary copy of the DICOM files.
+  - Copies the pipeline-selected T2, ADC, and HIGHB DICOM series into `output/dicom/{t2,adc,highb}/` so radiologists can import DICOMs + RTSTRUCTs together into a viewer. For HIGHB, only the highest b‑value files are copied.
 
 ### Lesion classification (PI‑RADS)
 - Operator: `ProstateLesionClassifierOperator` (`prostate_mri_lesion_seg_app/custom_lesion_classifier_operator.py`)
@@ -170,7 +204,7 @@ Requirements are enumerated in `prostate_mri_lesion_seg_app/requirements.txt`. A
 ./scripts/test_local.sh -i test-data/ProstateX-0004/ -o output/ -m models/ -c
 ```
 
-### MAP (containerized)
+### MAP (containerized via Holoscan CLI)
 
 Build and run a MONAI Application Package (requires Holoscan CLI):
 
@@ -182,15 +216,68 @@ Build and run a MONAI Application Package (requires Holoscan CLI):
 ./scripts/test_MAP.sh -i test-data/ProstateX-0004/ -o output/ -m prostate_mri_lesion_seg_app/models/
 ```
 
+### Docker (containerized, for HIVE / air-gapped deployment)
+
+A standalone Docker image is provided under `docker/` for deployment on machines without the full MONAI Deploy SDK (e.g. HIVE). The image bundles only the application code and Python dependencies; models, input data, and output are volume-mounted at runtime.
+
+**Build and save the Docker image:**
+
+```bash
+python scripts/build_and_save.py
+# Produces docker/docker_image.tar (~4–6 GB)
+```
+
+**Load and run a single patient:**
+
+```bash
+python scripts/load_and_run.py -i test-data/ProstateX-0004/ -o output/ -m models/
+# Or with a pre-saved tar:
+python scripts/load_and_run.py -i <input_dir> -o <output_dir> -m <models_dir> --tar docker/docker_image.tar
+# CPU mode (much slower):
+python scripts/load_and_run.py -i <input_dir> -o <output_dir> -m <models_dir> --cpu
+```
+
+**Batch-process multiple patients (Docker):**
+
+```bash
+python scripts/batch_load_and_run.py \
+    -i /data/patients/ -o /output/ -m /models/ \
+    --tar docker/docker_image.tar \
+    -r --cooldown 5
+```
+
+**Docker Compose** (single patient, convenience):
+
+```bash
+INPUT_DIR=/data/patient01 OUTPUT_DIR=/output/patient01 MODEL_DIR=/models \
+    docker compose -f docker/docker-compose.yaml up
+```
+
+The Docker image uses NVIDIA CUDA 12.4 + cuDNN runtime (Ubuntu 22.04, Python 3.10) with PyTorch 2.6.0 (CUDA 12.4).
+
+### Batch processing (local, non-Docker)
+
+```bash
+./scripts/test_batch.sh -i /data/patients/ -o /output/ -m models/
+# With resume and cooldown:
+./scripts/test_batch.sh -i /data/patients/ -o /output/ -m models/ -r --cooldown 30
+```
+
+Batch processing features:
+- **Resume mode** (`-r`): skips patients that already have output files (NIfTI or DCM).
+- **Cooldown** (`--cooldown SECS`): pauses between cases to prevent thermal issues (default 30 s).
+- **Audit CSV** (`--audit-csv PATH`): writes a per-case status CSV (default `<output>/batch_audit_log.csv`) with status classification, missing modalities, elapsed time, and file presence flags.
+- Status vocabulary: `SUCCESS_COMPLETE`, `SUCCESS_EMPTY_LESION`, `FAIL_MISSING_MODALITY`, `FAIL_ORGAN_SEG`, `FAIL_LESION_SEG`, `FAIL_CLASSIFIER`, `FAIL_RUNTIME`, `FAIL_EMPTY_OUTPUT`, `SKIPPED_RESUME`.
+
 ### Using this Repository
 
 The easiest way to get started with this workflow is to run a test image taken from the [ProstateX](https://wiki.cancerimagingarchive.net/pages/viewpage.action?pageId=23691656) dataset. The `build_and_run.ipynb` file walks through this process using ProstateX-0004 which can be [downloaded separately](https://drive.google.com/drive/folders/1besSncSLlbeiv7UWveRJoOYQXOzu3JkU?usp=sharing) and placed in a `test-data/` directory.
 
-After validating on test data, you can test this image on your own study or dataset. One of the main considerations when adapting to a new dataset will be the making sure the [DICOM Series Selector Operator](https://docs.monai.io/projects/monai-deploy-app-sdk/en/latest/modules/_autosummary/monai.deploy.operators.DICOMSeriesSelectorOperator.html#monai.deploy.operators.DICOMSeriesSelectorOperator) is configured to properly differentiate between the different naming schemes and properties of the new dataset.
+After validating on test data, you can test this image on your own study or dataset. One of the main considerations when adapting to a new dataset will be making sure the [DICOM Series Selector Operator](https://docs.monai.io/projects/monai-deploy-app-sdk/en/latest/modules/_autosummary/monai.deploy.operators.DICOMSeriesSelectorOperator.html#monai.deploy.operators.DICOMSeriesSelectorOperator) is configured to properly differentiate between the different naming schemes and properties of the new dataset.
 
 If all three (T2, ADC, HighB) series are not detected properly in the study, the pipeline will not complete. If any of these modalities are incorrectly routed, the pipeline results will not be accurate. The workflow currently saves intermediate copies (in NIfTI) of these series in the output folder so it is possible to verify they were picked up (and preprocessed) correctly.
 
-The current set of rules in `app.py` filter based on SeriesDescription, ImageType, etc., and work with ProstateX. Please refer to MONAI documentation for guidance on modifying these rules for custom filtering.
+The current set of rules in `app.py` filter based on SeriesDescription and work with both ProstateX and SGH de-identified datasets. They were validated on ~43,500 annotated rows — see `scripts/validate_selection_rules.py` for the validation harness. Please refer to MONAI documentation for guidance on modifying these rules for custom filtering.
 
 
 ## Training
@@ -243,30 +330,36 @@ This calls `scripts/eval_dice.py` under the hood (loads two NIfTI files, compute
 - Organ segmentation: `models/organ/model.ts` (TorchScript, used by MONAI Deploy inference operator).
 - Lesion segmentation: `models/fold0..fold4/model_best_fold*.pth.tar` (5‑fold RR‑UNet ensemble).
 - Lesion classifier: `models/classifier/model_best.pth.tar` (3D ResNet, 4 classes → PI‑RADS 2–5).
-- Outputs are written under `output/` as described above.
+- Outputs are written under `output/` as described above (NIfTI volumes, RTSTRUCTs, DICOM copies, and classification report).
 
 
 ## Assumptions and constraints
 
-- Assumes valid T2, ADC, and high b‑value series are present; selection is regex-based and tuned for ProstateX-like names.
+- Assumes valid T2, ADC, and high b‑value series are present; selection is regex-based, tuned for ProstateX and SGH de-identified naming conventions.
+- For multi-b-value HIGHB series, only the highest b‑value slices are used; lower b‑value slices are discarded by `HighBValueFilterOperator`.
 - Resampling strategy: organ seg at 1.0 mm; lesion seg/classifier at 0.5 mm isotropic.
 - Lesion segmentation is explicitly organ‑constrained:
   - ROI crop for inference is centered on the prostate mask with a margin.
   - Post-inference probabilities are multiplied by the organ mask prior to thresholding.
-- Fixed lesion threshold (0.6344772701607316) after ensemble averaging.
-- Organ segmentation produces multi-class output (background/TZ/PZ) when `threshold=None` is used in post-processing.
+  - If the organ mask is empty (no prostate detected), lesion inference is skipped entirely.
+- Fixed lesion threshold (0.63) after ensemble averaging.
+- Organ segmentation produces multi-class output (background/TZ/PZ) via argmax post-processing.
+- RTSTRUCT generation requires the `rt-utils` package and handles SGH de-identified data quirks (missing `StudyID` tag, slice count mismatches between NIfTI and DICOM).
 - GPU strongly recommended (PyTorch + 3D inference); CPU fallback supported.
 
 
 ## Comparison-ready highlights
 
-- Multi-parametric inputs (T2 + ADC + high b‑value), with curated series selection rules, increase robustness to site naming variability.
+- Multi-parametric inputs (T2 + ADC + high b‑value), with curated series selection rules validated on ~43,500 annotated rows, increase robustness to site naming variability.
+- Automatic highest-b-value filtering handles multi-b DWI series without manual intervention.
 - Two-stage approach:
   - Organ segmentation ensures prostate-focused processing and provides multi-class anatomical zones (TZ/PZ).
   - Lesion segmentation is both ROI‑focused and organ‑masked for fewer false positives.
 - 5‑fold ensemble improves lesion robustness and calibration; fold probabilities are exported for transparency.
 - PI‑RADS classification uses 3D crops and a size-based rule to better separate 4 vs. 5.
-- Clear, audit-friendly artifacts: NIfTI inputs/outputs, merged probabilities, final masks, RTSTRUCT files, and a concise YAML report.
+- Clear, audit-friendly artifacts: NIfTI inputs/outputs, merged probabilities, final masks, three RTSTRUCT files (organ, lesion, combined), copied DICOM series, and a concise YAML report.
+- Combined RTSTRUCT merges organ zones and lesion contours into a single DICOM RT Structure Set for convenient viewing in clinical DICOM viewers (e.g. CARPL).
+- Batch pipeline includes per-case audit CSV with structured status classification, enabling systematic quality review over large cohorts.
 
 
 ## Key source files
@@ -275,10 +368,12 @@ This calls `scripts/eval_dice.py` under the hood (loads two NIfTI files, compute
 - Organ segmentation operator: `prostate_mri_lesion_seg_app/organ_seg_operator.py`
 - Lesion segmentation operator: `prostate_mri_lesion_seg_app/custom_lesion_seg_operator.py`
 - Lesion classifier operator: `prostate_mri_lesion_seg_app/custom_lesion_classifier_operator.py`
+- High b‑value filter operator: `prostate_mri_lesion_seg_app/highb_filter_operator.py`
 - Models: `prostate_mri_lesion_seg_app/rrunet3D.py`, `prostate_mri_lesion_seg_app/resnet.py`
 - Utilities: `prostate_mri_lesion_seg_app/common.py`, `prostate_mri_lesion_seg_app/rtstruct_utils.py`
 - Training: `training/engine.py`, `training/train_organ.py`, `training/train_lesion.py`
-- Scripts: `scripts/test_local.sh`, `scripts/test_MAP.sh`, `scripts/compare_output.sh`, `scripts/eval_dice.py`
+- Docker: `docker/Dockerfile`, `docker/docker-compose.yaml`, `docker/requirements.txt`
+- Scripts: see [Scripts](#scripts) section below
 
 
 ## Quick sanity check after a run
@@ -288,19 +383,42 @@ This calls `scripts/eval_dice.py` under the hood (loads two NIfTI files, compute
   - `output/organ/organ.nii.gz` (multi-class: 0=background, 1=TZ, 2=PZ)
   - `output/lesion/fold*_lesion_prob.nii.gz`, `output/lesion/merged_lesion_prob.nii.gz`, `output/lesion/lesion_mask.nii.gz`
   - `output/lesions.txt` (PI‑RADS per lesion)
-  - `output/organ/organ.rtstruct.dcm`, `output/lesion/lesion.rtstruct.dcm` (if RTSTRUCT generation succeeds)
+  - `output/organ/organ_RTSTRUCT.dcm`, `output/lesion/lesion_RTSTRUCT.dcm`, `output/combined_organ_lesion_RTSTRUCT.dcm` (if RTSTRUCT generation succeeds)
+  - `output/dicom/t2/`, `output/dicom/adc/`, `output/dicom/highb/` (copies of pipeline-selected DICOM series)
+- For batch runs, inspect the audit CSV (`batch_audit_log.csv`) for per-case status:
+  ```bash
+  python scripts/case_status.py summary output/batch_audit_log.csv
+  ```
 
 If you need a simple visualization, see `build_and_run.ipynb` for an example to overlay organ/lesion masks on T2.
 
 
 ## Scripts
 
-There are several scripts to help with validation and development included in the `scripts/` directory.
+There are several scripts to help with running, validation, deployment, and development included in the `scripts/` directory.
+
+### Running
 
 - `scripts/test_local.sh`: Execute workflow locally on test images without building a MAP.
 - `scripts/test_MAP.sh`: Execute MAP workflow on test images with option to rebuild MAP.
+- `scripts/test_batch.sh`: Batch processing script for multiple patients (local, non-Docker). Supports resume (`-r`), cooldown between cases (`--cooldown`), and per-case audit CSV logging (`--audit-csv`).
+- `scripts/load_and_run.py`: Load the Docker image from a `.tar` file and run the pipeline on a single patient inside a container. Used for HIVE / air-gapped deployment.
+- `scripts/batch_load_and_run.py`: Batch-process multiple patients through the Dockerised pipeline. Each patient runs in a fresh container for crash isolation and clean GPU memory. Supports resume, cooldown, and audit CSV (same format as `test_batch.sh`).
+
+### Docker build
+
+- `scripts/build_and_save.py`: Build the `prostate-mri-seg` Docker image from `docker/Dockerfile` and save it as `docker/docker_image.tar` for transfer to HIVE or air-gapped machines.
+
+### Evaluation and validation
+
 - `scripts/compare_output.sh`: Computes organ and lesion DICE scores for two output directories.
-- `scripts/test_batch.sh`: Batch processing script for multiple patients.
+- `scripts/eval_dice.py`: Loads two NIfTI files and computes mean DICE (called by `compare_output.sh`).
+- `scripts/validate_selection_rules.py`: Validates T2/ADC/HIGHB selection rules (from `app.py`) against an annotated ground-truth CSV. Reports precision, recall, F1, and lists false positives / negatives per class.
+
+### Data investigation
+
+- `scripts/fill_series_description_template.py`: Scan DICOM directories and generate a CSV with per-series metadata (SeriesDescription, b-values, slice counts) and selection rule match flags. Supports multi-threaded processing, resume from interrupted runs, and exhaustive b-value enumeration across all slices.
+- `scripts/case_status.py`: Per-case status detection and CSV audit logging module. Inspects output directories for expected files and classifies outcomes into a fixed vocabulary (`SUCCESS_COMPLETE`, `FAIL_MISSING_MODALITY`, etc.). Used by both `test_batch.sh` and `batch_load_and_run.py`.
 
 
 ## Publications
