@@ -54,9 +54,15 @@ with the conditions stated in this Agreement. Whenever Recipient distributes or
 redistributes the SOFTWARE, a copy of this Agreement must be included with
 each copy of the SOFTWARE.'''
 
+import logging
 import numpy as np
 import copy
 from skimage.measure import label
+from scipy.ndimage import (
+    binary_fill_holes,
+    distance_transform_edt,
+    label as ndimage_label,
+)
 
 ###############################################################################
 def bounding_box_3d(nda):
@@ -147,3 +153,344 @@ def standard_normalization_multi_channel(nda):
         nda[_i, ...] = (nda[_i, ...] - np.mean(nda[_i, ...])) / np.std(nda[_i, ...])
 
     return nda
+
+
+###############################################################################
+# Organ mask cleanup: remove erroneous islands, fill holes
+###############################################################################
+
+def clean_organ_mask(
+    organ_data: np.ndarray,
+    fill_holes: bool = True,
+    return_metrics: bool = False,
+):
+    """Clean a multi-class organ segmentation mask by removing erroneous islands.
+
+    Strategy:
+      1. Binarize the organ mask (any non-zero label → 1).
+      2. Keep only the largest connected component (the prostate gland).
+      3. Optionally fill holes in the largest component for smoother contours.
+      4. Restore the original class labels (0=background, 1=TZ, 2=PZ).
+         Newly filled voxels receive the nearest retained non-zero label.
+
+    This handles the multi-class case correctly: a TZ island disconnected from
+    the main prostate mass will be removed even though its label differs from
+    PZ voxels. The spatial connectivity is what matters, not the label value.
+
+    Parameters
+    ----------
+    organ_data : np.ndarray
+        3D array with class labels (0=background, 1=TZ, 2=PZ or 0=bg, 1=prostate).
+    fill_holes : bool
+        If True, apply binary_fill_holes to the cleaned binary mask before
+        restoring class labels. This fills internal cavities.
+    return_metrics : bool
+        If True, return ``(cleaned_mask, metrics)``. The metrics are intended
+        for per-case audit logging.
+
+    Returns
+    -------
+    np.ndarray or tuple[np.ndarray, dict]
+        Cleaned organ mask with the same dtype and shape as input, optionally
+        accompanied by cleanup metrics.
+    """
+    if organ_data is None:
+        raise ValueError("organ_data must not be None")
+    if organ_data.ndim < 2:
+        raise ValueError(
+            f"Expected a 2D or 3D organ mask, got shape {organ_data.shape}"
+        )
+
+    original_dtype = organ_data.dtype
+    binary_mask = (organ_data > 0).astype(np.uint8)
+    original_voxels = int(np.sum(binary_mask))
+
+    metrics = {
+        "cleanup_applied": True,
+        "connectivity": "full",
+        "original_component_count": 0,
+        "original_foreground_voxels": original_voxels,
+        "largest_component_voxels": 0,
+        "largest_component_fraction": 0.0,
+        "removed_island_count": 0,
+        "removed_voxels": 0,
+        "filled_hole_voxels": 0,
+        "cleaned_foreground_voxels": 0,
+    }
+
+    if original_voxels == 0:
+        cleaned_empty = organ_data.copy()
+        return (
+            (cleaned_empty, metrics)
+            if return_metrics
+            else cleaned_empty
+        )
+
+    # Full connectivity (8-connected in 2D, 26-connected in 3D) avoids
+    # incorrectly splitting voxels that meet diagonally.
+    structure = np.ones((3,) * binary_mask.ndim, dtype=np.uint8)
+    labeled_array, num_features = ndimage_label(
+        binary_mask,
+        structure=structure,
+    )
+    component_sizes = np.bincount(labeled_array.ravel())
+    largest_label = int(np.argmax(component_sizes[1:]) + 1)
+    largest_voxels = int(component_sizes[largest_label])
+    largest_binary = labeled_array == largest_label
+
+    metrics["original_component_count"] = int(num_features)
+    metrics["largest_component_voxels"] = largest_voxels
+    metrics["largest_component_fraction"] = round(
+        largest_voxels / original_voxels,
+        6,
+    )
+    metrics["removed_island_count"] = max(int(num_features) - 1, 0)
+    metrics["removed_voxels"] = original_voxels - largest_voxels
+
+    cleaned_binary = largest_binary
+    if fill_holes:
+        cleaned_binary = binary_fill_holes(largest_binary)
+    newly_filled = cleaned_binary & ~largest_binary
+    metrics["filled_hole_voxels"] = int(np.sum(newly_filled))
+    metrics["cleaned_foreground_voxels"] = int(np.sum(cleaned_binary))
+
+    # Preserve existing TZ/PZ labels on the retained component.
+    cleaned_organ = np.zeros_like(organ_data)
+    cleaned_organ[largest_binary] = organ_data[largest_binary]
+
+    # Fill newly created voxels with the nearest retained class label. This is
+    # necessary for multi-class masks: merely filling the binary mask would
+    # otherwise leave the original zero-valued holes unchanged.
+    if np.any(newly_filled):
+        _, nearest_indices = distance_transform_edt(
+            cleaned_organ == 0,
+            return_indices=True,
+        )
+        nearest_labels = cleaned_organ[tuple(nearest_indices)]
+        cleaned_organ[newly_filled] = nearest_labels[newly_filled]
+
+    removed_voxels = metrics["removed_voxels"]
+    if removed_voxels or metrics["filled_hole_voxels"]:
+        logging.info(
+            "Organ cleanup: components=%d, removed_islands=%d, "
+            "removed_voxels=%d, filled_hole_voxels=%d, "
+            "largest_fraction=%.4f.",
+            metrics["original_component_count"],
+            metrics["removed_island_count"],
+            removed_voxels,
+            metrics["filled_hole_voxels"],
+            metrics["largest_component_fraction"],
+        )
+    else:
+        logging.info(
+            "Organ cleanup: mask already clean (one component, no holes)."
+        )
+
+    cleaned_organ = cleaned_organ.astype(original_dtype)
+    return (
+        (cleaned_organ, metrics)
+        if return_metrics
+        else cleaned_organ
+    )
+
+
+def clean_lesion_mask(
+    lesion_data: np.ndarray,
+    min_voxels: int = 10,
+    voxel_volume_mm3: float = 0.125,
+) -> np.ndarray:
+    """Remove tiny lesion islands below a minimum voxel count threshold.
+
+    Unlike organ cleanup, we do NOT keep only the largest component —
+    patients can have multiple legitimate lesion foci. Instead, we remove
+    only islands smaller than *min_voxels* which are almost certainly noise
+    or false-positive fragmentary detections.
+
+    Parameters
+    ----------
+    lesion_data : np.ndarray
+        3D binary lesion mask (0=background, 1=lesion).
+    min_voxels : int
+        Minimum number of voxels for a lesion island to be retained.
+        Default 10 voxels at 0.5mm isotropic = 1.25 mm³ minimum volume.
+    voxel_volume_mm3 : float
+        Volume of a single voxel in mm³ (for logging only). Default 0.125
+        corresponds to 0.5×0.5×0.5 mm isotropic.
+
+    Returns
+    -------
+    np.ndarray
+        Cleaned lesion mask with same dtype and shape as input.
+    """
+    if lesion_data is None or not np.any(lesion_data):
+        return lesion_data
+
+    original_dtype = lesion_data.dtype
+    binary_mask = (lesion_data > 0).astype(np.uint8)
+
+    structure = np.ones((3,) * binary_mask.ndim, dtype=np.uint8)
+    labeled_array, num_features = ndimage_label(
+        binary_mask,
+        structure=structure,
+    )
+    if num_features <= 1:
+        # Single island or empty — check size
+        if num_features == 1:
+            size = int(np.sum(binary_mask))
+            if size < min_voxels:
+                logging.info(
+                    "Lesion cleanup: removed single island of %d voxels (< %d threshold).",
+                    size, min_voxels,
+                )
+                return np.zeros_like(lesion_data)
+        return lesion_data
+
+    # Compute sizes of each component
+    component_sizes = np.bincount(labeled_array.ravel())
+    # component_sizes[0] is background
+
+    removed_count = 0
+    removed_voxels = 0
+    cleaned_mask = binary_mask.copy()
+
+    for label_id in range(1, num_features + 1):
+        size = component_sizes[label_id]
+        if size < min_voxels:
+            cleaned_mask[labeled_array == label_id] = 0
+            removed_count += 1
+            removed_voxels += size
+
+    if removed_count > 0:
+        min_vol_mm3 = min_voxels * voxel_volume_mm3
+        logging.info(
+            "Lesion cleanup: removed %d island(s) totalling %d voxels "
+            "(each < %d voxels / %.2f mm³). Remaining islands: %d.",
+            removed_count, removed_voxels, min_voxels, min_vol_mm3,
+            num_features - removed_count,
+        )
+    else:
+        logging.info(
+            "Lesion cleanup: all %d island(s) above threshold (%d voxels).",
+            num_features, min_voxels,
+        )
+
+    return cleaned_mask.astype(original_dtype)
+
+
+###############################################################################
+# Prostate volume and orthogonal dimensions calculation
+###############################################################################
+
+def compute_prostate_measurements(
+    organ_data: np.ndarray,
+    voxel_spacing: tuple | None = None,
+    affine: np.ndarray | None = None,
+) -> dict:
+    """Compute prostate gland physical measurements from a cleaned organ mask.
+
+    Parameters
+    ----------
+    organ_data : np.ndarray
+        3D organ mask (cleaned). Any non-zero voxel is considered prostate.
+    voxel_spacing : tuple of float, optional
+        Fallback ``(spacing_x, spacing_y, spacing_z)`` in mm. Used only when
+        *affine* is not provided.
+    affine : np.ndarray, optional
+        NIfTI voxel-to-RAS affine. When provided, volume is calculated from
+        its determinant and the three dimensions are reported along patient
+        left-right (LR), anterior-posterior (AP), and superior-inferior (SI)
+        axes, including the full physical voxel footprint.
+
+    Returns
+    -------
+    dict with keys:
+        - volume_mm3: float — total prostate volume in cubic millimeters
+        - volume_cc: float — total prostate volume in cubic centimeters (mL)
+        - left_right_mm: float — physical LR extent
+        - anterior_posterior_mm: float — physical AP extent
+        - superior_inferior_mm: float — physical SI extent
+        - dim_x_mm/dim_y_mm/dim_z_mm: aliases for LR/AP/SI
+        - dimensions_mm: list of 3 floats sorted descending [largest, middle, smallest]
+    """
+    result = {
+        "volume_mm3": 0.0,
+        "volume_cc": 0.0,
+        "left_right_mm": 0.0,
+        "anterior_posterior_mm": 0.0,
+        "superior_inferior_mm": 0.0,
+        "dim_x_mm": 0.0,
+        "dim_y_mm": 0.0,
+        "dim_z_mm": 0.0,
+        "dimensions_mm": [0.0, 0.0, 0.0],
+    }
+
+    if organ_data is None or not np.any(organ_data):
+        return result
+
+    binary_mask = organ_data > 0
+    if binary_mask.ndim == 2:
+        binary_mask = binary_mask[..., np.newaxis]
+    if binary_mask.ndim != 3:
+        raise ValueError(
+            f"Expected a 2D or 3D organ mask, got shape {organ_data.shape}"
+        )
+
+    prostate_voxels = int(np.sum(binary_mask))
+    coords = np.argwhere(binary_mask > 0)
+    if len(coords) == 0:
+        return result
+
+    if affine is not None:
+        affine = np.asarray(affine, dtype=np.float64)
+        if affine.shape != (4, 4):
+            raise ValueError(
+                f"Expected a 4x4 affine matrix, got shape {affine.shape}"
+            )
+        linear = affine[:3, :3]
+        voxel_volume_mm3 = abs(float(np.linalg.det(linear)))
+
+        # NIfTI world coordinates are RAS: X=LR, Y=AP, Z=SI. Transform
+        # foreground voxel centers and then add the projected half-voxel
+        # footprint on each world axis. This gives the physical bounding-box
+        # extent without assuming voxel axes are already canonical.
+        world_centers = coords @ linear.T + affine[:3, 3]
+        center_extent = np.ptp(world_centers, axis=0)
+        half_voxel_extent = 0.5 * np.sum(np.abs(linear), axis=1)
+        physical_extents = center_extent + 2.0 * half_voxel_extent
+    else:
+        if voxel_spacing is None:
+            raise ValueError("Either affine or voxel_spacing must be provided")
+        spacing = np.asarray(voxel_spacing[:3], dtype=np.float64)
+        if spacing.shape != (3,) or np.any(spacing <= 0):
+            raise ValueError(
+                f"Invalid voxel spacing: {voxel_spacing}"
+            )
+        voxel_volume_mm3 = float(np.prod(spacing))
+        extent_voxels = coords.max(axis=0) - coords.min(axis=0) + 1
+        physical_extents = extent_voxels * spacing
+
+    volume_mm3 = prostate_voxels * voxel_volume_mm3
+    volume_cc = volume_mm3 / 1000.0
+    left_right_mm, anterior_posterior_mm, superior_inferior_mm = [
+        float(value) for value in physical_extents
+    ]
+    dimensions = sorted(
+        [
+            left_right_mm,
+            anterior_posterior_mm,
+            superior_inferior_mm,
+        ],
+        reverse=True,
+    )
+
+    result["volume_mm3"] = round(volume_mm3, 2)
+    result["volume_cc"] = round(volume_cc, 2)
+    result["left_right_mm"] = round(left_right_mm, 2)
+    result["anterior_posterior_mm"] = round(anterior_posterior_mm, 2)
+    result["superior_inferior_mm"] = round(superior_inferior_mm, 2)
+    result["dim_x_mm"] = result["left_right_mm"]
+    result["dim_y_mm"] = result["anterior_posterior_mm"]
+    result["dim_z_mm"] = result["superior_inferior_mm"]
+    result["dimensions_mm"] = [round(d, 2) for d in dimensions]
+
+    return result

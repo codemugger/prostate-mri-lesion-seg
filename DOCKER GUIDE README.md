@@ -180,7 +180,7 @@ python batch_load_and_run.py \
 
 | Flag | Description |
 |------|-------------|
-| `-r` / `--resume` | Skip patients whose output directory already has `.nii.gz` / `.dcm` files |
+| `-r` / `--resume` | Skip only complete current-format cases; rerun incomplete or legacy outputs |
 | `--cooldown N` | Seconds to pause between patients (default 30, prevents thermal issues) |
 | `--skip-load` | Skip `docker load` if image is already loaded |
 | `--cpu` | Run without GPU (fallback) |
@@ -191,8 +191,10 @@ output/
 ├── ProstateX-0004/
 │   ├── t2/t2.nii.gz
 │   ├── organ/organ.nii.gz
+│   ├── organ/cleaned_organ.nii.gz
 │   ├── lesion/lesion_mask.nii.gz
 │   ├── lesions.txt
+│   ├── prostate_measurements_SR.dcm
 │   └── ...
 ├── ProstateX-0010/
 │   └── ...
@@ -202,9 +204,17 @@ output/
 
 After completion a summary is printed:
 ```
-Total: 50  Succeeded: 48  Failed: 2  Skipped: 0
+Total: 50  Container exit 0: 50  Container non-zero: 0  Resume-skipped: 0
+FAIL_EMPTY_OUTPUT          2
+SUCCESS_COMPLETE          48
+Guardrail result: FAILED (2 case audit failures)
 ```
-with a list of failed patient IDs (if any).
+The batch returns non-zero if any final audit status begins with `FAIL_`,
+including silent failures where the MONAI app itself returned exit code 0.
+
+Both local and Docker batch runners hold a non-blocking lock beside the
+output root. A second process targeting the same output directory exits
+immediately instead of concurrently modifying cases or the audit CSV.
 
 ---
 
@@ -235,10 +245,16 @@ writes an audit CSV (one row per case):
 | `elapsed_seconds` | Wall time for this case |
 | `resume_skipped` | `true` if the case was skipped by resume mode |
 | `has_t2_nii`, `has_adc_nii`, `has_highb_nii` | Intermediate NIfTI presence |
-| `has_organ_nii`, `has_organ_rtstruct` | Organ segmentation outputs |
+| `has_organ_nii`, `has_cleaned_organ_nii` | Original and cleaned organ masks |
+| `has_cleanup_metrics` | Organ cleanup audit JSON |
+| `has_organ_rtstruct`, `has_cleaned_organ_rtstruct` | Original and cleaned organ RTSTRUCTs |
 | `has_lesion_mask`, `has_lesion_rtstruct` | Lesion segmentation outputs |
 | `has_merged_lesion_prob`, `has_lesion_folds` | Real lesion inference (vs empty-mask fallback) |
 | `has_lesions_txt` | Classifier (PI-RADS) report |
+| `has_prostate_sr` | DICOM prostate measurement Structured Report |
+| `has_combined_rtstruct` | Combined cleaned-organ + lesion RTSTRUCT |
+| `organ_cleanup_status` | `UNCHANGED`, `CLEANED`, `EMPTY`, or `INVALID` |
+| `organ_island_count_before`, `organ_removed_island_count`, `organ_removed_voxels`, `organ_filled_hole_voxels`, `organ_largest_component_fraction` | Organ cleanup metrics |
 | `output_file_count` | Total files under the case output dir |
 | `input_dir`, `output_dir` | Absolute paths |
 
@@ -246,12 +262,15 @@ writes an audit CSV (one row per case):
 
 | `status` | Meaning | Action |
 |---|---|---|
-| `SUCCESS_COMPLETE` | All modalities selected, organ + lesion inference ran, classifier report produced. | — |
+| `SUCCESS_COMPLETE` | Organ cleanup, lesion inference, RTSTRUCTs, YAML report, and DICOM SR all completed. | — |
 | `SUCCESS_EMPTY_LESION` | Organ mask was empty (no prostate detected); lesion inference was intentionally skipped and an empty mask written. | Review series selection / organ model. |
 | `FAIL_MISSING_MODALITY` | Selector produced 0 matches for at least one of T2 / ADC / HIGHB. See `missing_modalities`. | Usually a genuine data issue (see `series_description_sgh_deid_data.tnt_with_anh_input.csv`). |
 | `FAIL_ORGAN_SEG` | Modalities present but `organ.nii.gz` missing. | Organ seg operator failure; check logs. |
+| `FAIL_POSTPROCESSING` | Original organ exists but cleaned mask or cleanup metrics are missing. | Check organ cleanup logs. |
 | `FAIL_LESION_SEG` | Organ present but `lesion_mask.nii.gz` missing. | Lesion seg operator failure. |
 | `FAIL_CLASSIFIER` | Lesion mask present but `lesions.txt` missing. | Classifier operator failure. |
+| `FAIL_REPORTING` | `lesions.txt` exists but the DICOM SR is missing. | Check malformed/missing source DICOM and SR logs. |
+| `FAIL_RTSTRUCT` | One or more required RTSTRUCT files are missing. | Check RTSTRUCT generation logs. |
 | `FAIL_RUNTIME` | Container exited with non-zero code. | Check stderr; may be partial. |
 | `FAIL_EMPTY_OUTPUT` | Exit 0 but no output files at all. | Every selector rejected the input. |
 | `SKIPPED_RESUME` | Resume mode: existing complete output re-used, not re-run. | — |
@@ -286,11 +305,12 @@ df.query("status.str.startswith('FAIL')")[
 ### Resume semantics
 
 * Fresh run (no `-r`): both `<output>/` and `batch_audit_log.csv` are wiped.
-* Resume (`-r`): the CSV is preserved and appended to. Cases already
-  logged for this `patient_id` are **not** re-logged (no duplicate rows).
-* Cases whose previous run produced no NIfTI / DCM output are re-tried
-  on resume (pre-existing batch behaviour); each retry adds a new
-  timestamped row so you can see the retry history.
+* Resume (`-r`): the CSV is preserved and appended to. Only cases with
+  every current required artifact are skipped.
+* Incomplete or legacy case directories are cleared and rerun so stale
+  artifacts cannot make a failed retry appear successful.
+* An older audit CSV header is migrated to the current column schema
+  before a new row is appended.
 
 ---
 
@@ -305,7 +325,10 @@ output/
 ├── highb/highb.nii.gz                  # Intermediate NIfTI (High-B)
 ├── organ/
 │   ├── organ.nii.gz                    # Multi-class prostate mask (0=bg, 1=TZ, 2=PZ)
-│   └── organ_RTSTRUCT.dcm             # DICOM RT Structure Set
+│   ├── cleaned_organ.nii.gz            # Largest component + filled holes
+│   ├── cleanup_metrics.json            # Organ cleanup audit
+│   ├── organ_RTSTRUCT.dcm              # Original organ RT Structure Set
+│   └── cleaned_organ_RTSTRUCT.dcm      # Cleaned organ RT Structure Set
 ├── lesion/
 │   ├── fold0–4_lesion_prob.nii.gz      # Per-fold probability maps
 │   ├── merged_lesion_prob.nii.gz       # Averaged probability map
@@ -315,9 +338,31 @@ output/
 │   ├── t2/
 │   ├── adc/
 │   └── highb/
-├── lesions.txt                         # PI-RADS report (YAML)
+├── lesions.txt                         # PI-RADS + prostate measurements (YAML)
+├── prostate_measurements_SR.dcm        # DICOM TID 1500 measurement report
 └── combined_organ_lesion_RTSTRUCT.dcm  # Combined organ + lesion RT Structure Set
 ```
+
+All four RTSTRUCT files use separate DICOM `CLOSEDPLANAR_XOR` contours.
+Pinhole/keyhole encoding is disabled because its artificial connector channels
+appear as lines through an ROI in viewers such as CARPL. Contour approximation
+is also disabled, and tiny point/line components are converted to valid
+pixel-footprint polygons so rasterizing the RTSTRUCT reproduces the NIfTI mask
+exactly.
+
+The SR is a DICOM Comprehensive SR referencing the selected T2 study. It
+contains cleaned-prostate LR/AP/SI dimensions (mm) and volume (mm³ and cm³),
+and is marked `COMPLETE`, `UNVERIFIED`, and not final pending clinical review.
+
+For a strict post-run RTSTRUCT guardrail check:
+
+```bash
+python scripts/validate_rtstruct_outputs.py <output-root>
+```
+
+This writes `rtstruct_validation.csv` and `rtstruct_validation.json` and exits
+non-zero for invalid geometry, references, ROI/mask mismatches, or any
+RTSTRUCT-to-NIfTI voxel difference.
 
 ---
 

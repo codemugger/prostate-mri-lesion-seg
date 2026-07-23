@@ -55,10 +55,12 @@ redistributes the SOFTWARE, a copy of this Agreement must be included with
 each copy of the SOFTWARE.'''
 
 import os
+import copy
 import tempfile
 import logging
 import numpy as np
 import nibabel as nib
+import pydicom
 from pathlib import Path
 from scipy import ndimage as ndi
 from scipy.ndimage import zoom as scipy_zoom
@@ -165,6 +167,141 @@ def _match_mask_to_dicom_slices(mask: np.ndarray, num_dicom_slices: int) -> np.n
     )
     zoom_factors = [1.0] * (mask.ndim - 1) + [num_dicom_slices / mask_slices]
     return scipy_zoom(mask.astype(np.float32), zoom_factors, order=0) > 0.5
+
+
+def _contour_area_mm2(points: np.ndarray) -> float:
+    """Return the area of a coplanar 3D polygon using Newell's method."""
+    if len(points) < 3:
+        return 0.0
+    area_vector = 0.5 * np.sum(
+        np.cross(points, np.roll(points, -1, axis=0)),
+        axis=0,
+    )
+    return float(np.linalg.norm(area_vector))
+
+
+def _repair_degenerate_contour(
+    contour,
+    pixel_axis_0: np.ndarray,
+    pixel_axis_1: np.ndarray,
+) -> list:
+    """Turn a line-like rt-utils contour into valid pixel-footprint polygons.
+
+    OpenCV emits one- or two-point contours for single-pixel and line-like
+    components. CLOSEDPLANAR_XOR requires a genuine closed polygon, but these
+    tiny components may represent real lesions and must not simply be dropped.
+    With contour approximation disabled, the unique points enumerate the thin
+    component's pixels. Each is represented by a separate 0.98-pixel square,
+    which rasterizes exactly without joining diagonal pixels or adding voxels.
+    """
+    points = np.asarray(contour.ContourData, dtype=np.float64).reshape(-1, 3)
+    if not np.all(np.isfinite(points)):
+        raise ValueError("RTSTRUCT contour contains non-finite coordinates")
+
+    unique_points = np.unique(np.round(points, decimals=8), axis=0)
+    if len(unique_points) >= 3 and _contour_area_mm2(points) > 1e-6:
+        return [contour]
+    if len(unique_points) == 0:
+        raise ValueError("RTSTRUCT contour contains no coordinates")
+
+    repaired_contours = []
+    for center in unique_points:
+        axis_0 = 0.49 * pixel_axis_0
+        axis_1 = 0.49 * pixel_axis_1
+        repaired = np.asarray(
+            [
+                center - axis_0 - axis_1,
+                center + axis_0 - axis_1,
+                center + axis_0 + axis_1,
+                center - axis_0 + axis_1,
+            ]
+        )
+        repaired_contour = copy.deepcopy(contour)
+        repaired_contour.ContourData = repaired.reshape(-1).tolist()
+        repaired_contour.NumberOfContourPoints = len(repaired)
+        repaired_contours.append(repaired_contour)
+    return repaired_contours
+
+
+def _finalize_rtstruct_xor_contours(
+    rtstruct_path: str | Path,
+    series_data,
+) -> dict[str, int]:
+    """Replace keyholes with standards-based XOR contours and validate them."""
+    dataset = pydicom.dcmread(str(rtstruct_path))
+    first_slice = series_data[0]
+    orientation = np.asarray(
+        first_slice.ImageOrientationPatient,
+        dtype=np.float64,
+    )
+    row_spacing, column_spacing = (
+        float(value) for value in first_slice.PixelSpacing
+    )
+    pixel_axis_0 = orientation[:3] * row_spacing
+    pixel_axis_1 = orientation[3:] * column_spacing
+
+    repaired_count = 0
+    contour_count = 0
+    for roi_contour in getattr(dataset, "ROIContourSequence", []):
+        finalized_contours = []
+        for source_contour in getattr(
+            roi_contour,
+            "ContourSequence",
+            [],
+        ):
+            repaired_contours = _repair_degenerate_contour(
+                source_contour,
+                pixel_axis_0,
+                pixel_axis_1,
+            )
+            if (
+                len(repaired_contours) != 1
+                or repaired_contours[0] is not source_contour
+            ):
+                repaired_count += 1
+            finalized_contours.extend(repaired_contours)
+
+        roi_contour.ContourSequence = finalized_contours
+        for contour_number, contour in enumerate(
+            finalized_contours,
+            start=1,
+        ):
+            contour.ContourGeometricType = "CLOSEDPLANAR_XOR"
+            contour.ContourNumber = contour_number
+            points = np.asarray(
+                contour.ContourData, dtype=np.float64
+            ).reshape(-1, 3)
+            if (
+                len(points) < 3
+                or len(np.unique(np.round(points, decimals=8), axis=0)) < 3
+                or _contour_area_mm2(points) <= 1e-6
+            ):
+                raise ValueError(
+                    "Unable to produce a valid closed RTSTRUCT contour"
+                )
+            contour_count += 1
+
+    dataset.save_as(str(rtstruct_path), enforce_file_format=True)
+    logging.info(
+        "Finalized %d RTSTRUCT contours as CLOSEDPLANAR_XOR "
+        "(%d degenerate contours repaired): %s",
+        contour_count,
+        repaired_count,
+        rtstruct_path,
+    )
+    return {
+        "contour_count": contour_count,
+        "repaired_degenerate_contour_count": repaired_count,
+    }
+
+
+def _save_rtstruct_with_xor_contours(rtstruct, output_path: str | Path) -> None:
+    """Save an rt-utils object without visible keyhole connector lines."""
+    rtstruct.save(str(output_path))
+    _finalize_rtstruct_xor_contours(
+        output_path,
+        rtstruct.series_data,
+    )
 
 
 def load_nifti_mask(nifti_path: str) -> np.ndarray:
@@ -292,14 +429,22 @@ def create_rtstruct_from_mask(
     output_rtstruct_path: str,
     roi_name: str = "ROI",
     roi_color: list[int] | None = None,
-    use_pin_hole: bool = True,
+    use_pin_hole: bool = False,
 ) -> None:
     """
-    Create an RTSTRUCT file from a NIfTI mask, mirroring the notebook pipeline.
+    Create an RTSTRUCT using separate CLOSEDPLANAR_XOR contours.
+
+    ``use_pin_hole`` is retained for API compatibility but must remain false:
+    keyhole encoding introduces visible connector lines through the ROI.
     """
     if roi_color is None:
         roi_color = [255, 0, 0]
 
+    if use_pin_hole:
+        raise ValueError(
+            "Pinhole RTSTRUCT contours are disabled because they introduce "
+            "visible connector lines; use CLOSEDPLANAR_XOR contours instead."
+        )
     if not os.path.exists(nifti_mask_path):
         raise FileNotFoundError(f"NIfTI mask file not found: {nifti_mask_path}")
 
@@ -320,10 +465,11 @@ def create_rtstruct_from_mask(
             mask=numpy_segmentation_mask,
             name=roi_name,
             color=roi_color,
-            use_pin_hole=use_pin_hole,
+            use_pin_hole=False,
+            approximate_contours=False,
         )
 
-        rtstruct.save(output_rtstruct_path)
+        _save_rtstruct_with_xor_contours(rtstruct, output_rtstruct_path)
         logging.info("RTSTRUCT saved to: %s", os.path.abspath(output_rtstruct_path))
     finally:
         if tmpdir is not None:
@@ -339,9 +485,14 @@ def generate_rtstruct_files(
     """
     Generate RTSTRUCT files for organ, lesion, and combined segmentations.
 
-    - Organ:    organ/organ.nii.gz       -> organ/organ_RTSTRUCT.dcm
-    - Lesion:   lesion/lesion_mask.nii.gz -> lesion/lesion_RTSTRUCT.dcm
-    - Combined: both masks               -> combined_organ_lesion_RTSTRUCT.dcm
+    - Organ (original): organ/organ.nii.gz       -> organ/organ_RTSTRUCT.dcm
+    - Organ (cleaned):  organ/cleaned_organ.nii.gz -> organ/cleaned_organ_RTSTRUCT.dcm
+    - Lesion:           lesion/lesion_mask.nii.gz -> lesion/lesion_RTSTRUCT.dcm
+    - Combined:         cleaned_organ + lesion    -> combined_organ_lesion_RTSTRUCT.dcm
+
+    The combined RTSTRUCT uses the *cleaned* organ mask (islands removed, holes
+    filled) so that clinical viewers display only the true prostate contour
+    alongside lesion contours.
 
     *t2_series_instance_uid* (preferred): the DICOM SeriesInstanceUID of the
     T2 series that the pipeline selected.  When provided, the function locates
@@ -368,6 +519,7 @@ def generate_rtstruct_files(
 
     results: dict[str, Optional[str]] = {
         "organ_rtstruct": None,
+        "cleaned_organ_rtstruct": None,
         "lesion_rtstruct": None,
         "combined_rtstruct": None,
         "t2_dicom_series": str(t2_dicom_series_path),
@@ -399,7 +551,8 @@ def generate_rtstruct_files(
                             mask=tz_mask,
                             name="Prostate_TZ",
                             color=[0, 0, 255],
-                            use_pin_hole=True,
+                            use_pin_hole=False,
+                            approximate_contours=False,
                         )
 
                     if pz_mask.any():
@@ -407,7 +560,8 @@ def generate_rtstruct_files(
                             mask=pz_mask,
                             name="Prostate_PZ",
                             color=[255, 255, 0],
-                            use_pin_hole=True,
+                            use_pin_hole=False,
+                            approximate_contours=False,
                         )
                     logging.info("Organ RTSTRUCT created (multi-class): %s", organ_rtstruct_path)
                 else:
@@ -419,11 +573,15 @@ def generate_rtstruct_files(
                             mask=whole_mask,
                             name="Prostate",
                             color=[0, 255, 0],
-                            use_pin_hole=True,
+                            use_pin_hole=False,
+                            approximate_contours=False,
                         )
                     logging.info("Organ RTSTRUCT created (binary): %s", organ_rtstruct_path)
 
-                rtstruct.save(str(organ_rtstruct_path))
+                _save_rtstruct_with_xor_contours(
+                    rtstruct,
+                    organ_rtstruct_path,
+                )
                 results["organ_rtstruct"] = str(organ_rtstruct_path)
             finally:
                 if tmpdir is not None:
@@ -434,6 +592,72 @@ def generate_rtstruct_files(
         logging.warning(
             "Organ NIfTI file not found: %s. Skipping organ RTSTRUCT generation.",
             organ_nifti_path,
+        )
+
+    # ---- Cleaned Organ RTSTRUCT ----
+    cleaned_organ_nifti_path = output_folder / "organ" / "cleaned_organ.nii.gz"
+    if cleaned_organ_nifti_path.exists():
+        cleaned_organ_rtstruct_path = output_folder / "organ" / "cleaned_organ_RTSTRUCT.dcm"
+        try:
+            nii = nib.load(str(cleaned_organ_nifti_path))
+            data = nii.get_fdata()
+            max_label = int(data.max())
+
+            patched_path, tmpdir = _ensure_study_id(str(t2_dicom_series_path))
+            try:
+                rtstruct = RTStructBuilder.create_new(dicom_series_path=patched_path)
+                num_dicom_slices = len(rtstruct.series_data)
+
+                if max_label >= 2:
+                    tz_mask = _prepare_mask_from_array(data == 1)
+                    pz_mask = _prepare_mask_from_array(data == 2)
+                    tz_mask = _match_mask_to_dicom_slices(tz_mask, num_dicom_slices)
+                    pz_mask = _match_mask_to_dicom_slices(pz_mask, num_dicom_slices)
+
+                    if tz_mask.any():
+                        rtstruct.add_roi(
+                            mask=tz_mask,
+                            name="Prostate_TZ",
+                            color=[0, 0, 255],
+                            use_pin_hole=False,
+                            approximate_contours=False,
+                        )
+                    if pz_mask.any():
+                        rtstruct.add_roi(
+                            mask=pz_mask,
+                            name="Prostate_PZ",
+                            color=[255, 255, 0],
+                            use_pin_hole=False,
+                            approximate_contours=False,
+                        )
+                    logging.info("Cleaned organ RTSTRUCT created (multi-class): %s", cleaned_organ_rtstruct_path)
+                else:
+                    whole_mask = _prepare_mask_from_array(data > 0)
+                    whole_mask = _match_mask_to_dicom_slices(whole_mask, num_dicom_slices)
+                    if whole_mask.any():
+                        rtstruct.add_roi(
+                            mask=whole_mask,
+                            name="Prostate",
+                            color=[0, 255, 0],
+                            use_pin_hole=False,
+                            approximate_contours=False,
+                        )
+                    logging.info("Cleaned organ RTSTRUCT created (binary): %s", cleaned_organ_rtstruct_path)
+
+                _save_rtstruct_with_xor_contours(
+                    rtstruct,
+                    cleaned_organ_rtstruct_path,
+                )
+                results["cleaned_organ_rtstruct"] = str(cleaned_organ_rtstruct_path)
+            finally:
+                if tmpdir is not None:
+                    tmpdir.cleanup()
+        except Exception as exc:
+            logging.error("Failed to create cleaned organ RTSTRUCT: %s", exc)
+    else:
+        logging.warning(
+            "Cleaned organ NIfTI not found: %s. Skipping cleaned organ RTSTRUCT.",
+            cleaned_organ_nifti_path,
         )
 
     # ---- Lesion RTSTRUCT ----
@@ -447,7 +671,7 @@ def generate_rtstruct_files(
                 output_rtstruct_path=str(lesion_rtstruct_path),
                 roi_name="Lesion",
                 roi_color=[255, 0, 0],  # Red for lesion
-                use_pin_hole=True,
+                use_pin_hole=False,
             )
             results["lesion_rtstruct"] = str(lesion_rtstruct_path)
             logging.info("Lesion RTSTRUCT created: %s", lesion_rtstruct_path)
@@ -462,7 +686,12 @@ def generate_rtstruct_files(
     # ---- Combined Organ + Lesion RTSTRUCT ----
     # Single RTSTRUCT containing all organ and lesion ROIs together, placed in
     # the case root so viewers like CARPL can load one file with every contour.
-    if organ_nifti_path.exists() and lesion_nifti_path.exists():
+    # Uses the CLEANED organ mask (islands removed) for clinical accuracy.
+    combined_organ_source = output_folder / "organ" / "cleaned_organ.nii.gz"
+    if not combined_organ_source.exists():
+        # Fallback to original if cleaned doesn't exist
+        combined_organ_source = organ_nifti_path
+    if combined_organ_source.exists() and lesion_nifti_path.exists():
         combined_rtstruct_path = output_folder / "combined_organ_lesion_RTSTRUCT.dcm"
         try:
             patched_path, tmpdir = _ensure_study_id(str(t2_dicom_series_path))
@@ -470,7 +699,7 @@ def generate_rtstruct_files(
                 rtstruct = RTStructBuilder.create_new(dicom_series_path=patched_path)
                 num_dicom_slices = len(rtstruct.series_data)
 
-                organ_nii = nib.load(str(organ_nifti_path))
+                organ_nii = nib.load(str(combined_organ_source))
                 organ_data = organ_nii.get_fdata()
                 organ_max_label = int(organ_data.max())
 
@@ -482,12 +711,14 @@ def generate_rtstruct_files(
                     if tz_mask.any():
                         rtstruct.add_roi(
                             mask=tz_mask, name="Prostate_TZ",
-                            color=[0, 0, 255], use_pin_hole=True,
+                            color=[0, 0, 255], use_pin_hole=False,
+                            approximate_contours=False,
                         )
                     if pz_mask.any():
                         rtstruct.add_roi(
                             mask=pz_mask, name="Prostate_PZ",
-                            color=[255, 255, 0], use_pin_hole=True,
+                            color=[255, 255, 0], use_pin_hole=False,
+                            approximate_contours=False,
                         )
                 else:
                     whole_mask = _prepare_mask_from_array(organ_data > 0)
@@ -495,7 +726,8 @@ def generate_rtstruct_files(
                     if whole_mask.any():
                         rtstruct.add_roi(
                             mask=whole_mask, name="Prostate",
-                            color=[0, 255, 0], use_pin_hole=True,
+                            color=[0, 255, 0], use_pin_hole=False,
+                            approximate_contours=False,
                         )
 
                 lesion_mask = load_nifti_mask(str(lesion_nifti_path))
@@ -503,10 +735,14 @@ def generate_rtstruct_files(
                 if lesion_mask.any():
                     rtstruct.add_roi(
                         mask=lesion_mask, name="Lesion",
-                        color=[255, 0, 0], use_pin_hole=True,
+                        color=[255, 0, 0], use_pin_hole=False,
+                        approximate_contours=False,
                     )
 
-                rtstruct.save(str(combined_rtstruct_path))
+                _save_rtstruct_with_xor_contours(
+                    rtstruct,
+                    combined_rtstruct_path,
+                )
                 results["combined_rtstruct"] = str(combined_rtstruct_path)
                 logging.info("Combined organ+lesion RTSTRUCT created: %s", combined_rtstruct_path)
             finally:
@@ -516,8 +752,9 @@ def generate_rtstruct_files(
             logging.error("Failed to create combined RTSTRUCT: %s", exc)
     else:
         logging.warning(
-            "Skipping combined RTSTRUCT: organ NIfTI exists=%s, lesion NIfTI exists=%s",
-            organ_nifti_path.exists(), lesion_nifti_path.exists(),
+            "Skipping combined RTSTRUCT: cleaned organ NIfTI exists=%s, lesion NIfTI exists=%s",
+            combined_organ_source.exists() if hasattr(combined_organ_source, 'exists') else False,
+            lesion_nifti_path.exists(),
         )
 
     return results
@@ -564,6 +801,7 @@ if __name__ == "__main__":  # pragma: no cover - CLI helper
     print("\nRTSTRUCT Generation Results:")
     print(f"  T2 DICOM Series: {res['t2_dicom_series']}")
     print(f"  Organ RTSTRUCT: {res['organ_rtstruct']}")
+    print(f"  Cleaned Organ RTSTRUCT: {res['cleaned_organ_rtstruct']}")
     print(f"  Lesion RTSTRUCT: {res['lesion_rtstruct']}")
     print(f"  Combined RTSTRUCT: {res['combined_rtstruct']}")
 

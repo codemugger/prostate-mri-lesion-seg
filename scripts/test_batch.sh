@@ -88,6 +88,32 @@ fi
 # Prepare output root directory
 mkdir -p "$OUTPUT_ROOT_DIR"
 
+# Prevent two batch processes from writing the same output tree concurrently.
+# The lock lives beside the output directory so a fresh run can safely clear
+# the output contents without deleting its own lock.
+LOCK_DIR="${OUTPUT_ROOT_DIR%/}.batch.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    LOCK_PID=""
+    if [ -f "$LOCK_DIR/pid" ]; then
+        LOCK_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    fi
+    if [ -n "$LOCK_PID" ] && kill -0 "$LOCK_PID" 2>/dev/null; then
+        echo "Error: Another batch process (PID $LOCK_PID) is already using: $OUTPUT_ROOT_DIR"
+        exit 1
+    fi
+    echo "WARNING: Removing stale batch lock: $LOCK_DIR"
+    rm -rf "$LOCK_DIR"
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo "Error: Could not acquire batch lock: $LOCK_DIR"
+        exit 1
+    fi
+fi
+echo "$$" > "$LOCK_DIR/pid"
+cleanup_lock() {
+    rm -rf "$LOCK_DIR"
+}
+trap cleanup_lock EXIT INT TERM
+
 # Audit CSV: single source of truth for per-case outcomes.  Lives under
 # the output root by default so it is carried back from HIVE alongside
 # the result NIfTIs.
@@ -175,11 +201,21 @@ for PATIENT_DIR in "$INPUT_ROOT_DIR"/*/; do
     echo "  Input:  $PATIENT_DIR"
     echo "  Output: $CASE_OUTPUT_DIR"
 
-    # Resume: skip if output already has NIfTI or RTSTRUCT files
+    # Resume: skip only a result that is complete for the CURRENT pipeline.
+    # Older outputs without cleaned organ files or DICOM SR must be rerun.
     if [ "$RESUME" -eq 1 ] && [ -d "$CASE_OUTPUT_DIR" ]; then
         FILE_COUNT=$(find "$CASE_OUTPUT_DIR" -type f \( -name "*.nii.gz" -o -name "*.dcm" \) 2>/dev/null | wc -l)
-        if [ "$FILE_COUNT" -gt 0 ]; then
-            echo "  SKIPPING (resume mode, $FILE_COUNT output files already exist)"
+        if [ -f "$CASE_OUTPUT_DIR/organ/organ.nii.gz" ] \
+            && [ -f "$CASE_OUTPUT_DIR/organ/cleaned_organ.nii.gz" ] \
+            && [ -f "$CASE_OUTPUT_DIR/organ/cleanup_metrics.json" ] \
+            && [ -f "$CASE_OUTPUT_DIR/organ/organ_RTSTRUCT.dcm" ] \
+            && [ -f "$CASE_OUTPUT_DIR/organ/cleaned_organ_RTSTRUCT.dcm" ] \
+            && [ -f "$CASE_OUTPUT_DIR/lesion/lesion_mask.nii.gz" ] \
+            && [ -f "$CASE_OUTPUT_DIR/lesion/lesion_RTSTRUCT.dcm" ] \
+            && [ -f "$CASE_OUTPUT_DIR/lesions.txt" ] \
+            && [ -f "$CASE_OUTPUT_DIR/prostate_measurements_SR.dcm" ] \
+            && [ -f "$CASE_OUTPUT_DIR/combined_organ_lesion_RTSTRUCT.dcm" ]; then
+            echo "  SKIPPING (resume mode, complete current-format output; $FILE_COUNT image files)"
             SKIPPED=$((SKIPPED + 1))
             # Log the skipped case too -- but only if it is not already
             # recorded in the CSV, so repeat resumes do not duplicate rows.
@@ -194,6 +230,9 @@ for PATIENT_DIR in "$INPUT_ROOT_DIR"/*/; do
                     || echo "  WARNING: audit log append failed for $PATIENT_ID"
             fi
             continue
+        elif [ "$FILE_COUNT" -gt 0 ]; then
+            echo "  RERUNNING (resume mode found incomplete or legacy output)"
+            rm -rf "$CASE_OUTPUT_DIR"/*
         fi
     fi
 
@@ -226,7 +265,6 @@ for PATIENT_DIR in "$INPUT_ROOT_DIR"/*/; do
 
     # Cooldown: let CPU/GPU cool down and release memory between cases
     if [ "$CURRENT" -lt "$TOTAL" ]; then
-        sync
         echo "  Cooldown ${COOLDOWN_SECS}s before next case..."
         sleep "$COOLDOWN_SECS"
     fi
@@ -235,10 +273,9 @@ done
 echo ""
 echo "========================================"
 echo "Batch processing complete."
-echo "  Total: $TOTAL  Succeeded: $SUCCEEDED  Failed: $FAILED  Skipped: $SKIPPED"
-echo "  Exit-code counters above reflect the app's raw return status."
-echo "  For the full per-case outcome (including silent empty outputs)"
-echo "  inspect the audit CSV: $AUDIT_CSV"
+echo "  Total: $TOTAL  App exit 0: $SUCCEEDED  App non-zero: $FAILED  Resume-skipped: $SKIPPED"
+echo "  Final success/failure is determined by the audit statuses below,"
+echo "  because the MONAI app can exit 0 after a silent selection failure."
 
 # Per-status breakdown from the audit CSV (best-effort).
 if [ -n "$AUDIT_PY" ] && [ -f "$AUDIT_CSV" ]; then
@@ -246,4 +283,26 @@ if [ -n "$AUDIT_PY" ] && [ -f "$AUDIT_CSV" ]; then
     echo "----- Per-status breakdown from audit CSV -----"
     "$AUDIT_PY" "$CASE_STATUS_PY" summary "$AUDIT_CSV" \
         || echo "  (summary generation failed)"
+
+    AUDIT_FAILURES=$(
+        "$AUDIT_PY" - "$AUDIT_CSV" <<'PY'
+import csv
+import sys
+
+with open(sys.argv[1], newline="", encoding="utf-8") as audit_file:
+    print(sum(
+        1
+        for row in csv.DictReader(audit_file)
+        if row.get("status", "").startswith("FAIL_")
+    ))
+PY
+    )
+    if [ "${AUDIT_FAILURES:-0}" -gt 0 ]; then
+        echo "  Guardrail result: FAILED ($AUDIT_FAILURES case audit failure(s))"
+        exit 1
+    fi
+fi
+
+if [ "$FAILED" -gt 0 ]; then
+    exit 1
 fi

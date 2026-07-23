@@ -18,6 +18,9 @@ HIVE usage:
 """
 
 import argparse
+import atexit
+import fcntl
+import os
 import shutil
 import subprocess
 import sys
@@ -51,6 +54,18 @@ EXPECTED_MODELS = [
 ]
 
 RESUME_CHECK_EXTENSIONS = {".nii.gz", ".dcm"}
+CURRENT_REQUIRED_OUTPUTS = (
+    "organ/organ.nii.gz",
+    "organ/cleaned_organ.nii.gz",
+    "organ/cleanup_metrics.json",
+    "organ/organ_RTSTRUCT.dcm",
+    "organ/cleaned_organ_RTSTRUCT.dcm",
+    "lesion/lesion_mask.nii.gz",
+    "lesion/lesion_RTSTRUCT.dcm",
+    "lesions.txt",
+    "prostate_measurements_SR.dcm",
+    "combined_organ_lesion_RTSTRUCT.dcm",
+)
 
 
 def _check_docker() -> None:
@@ -105,6 +120,44 @@ def _count_output_files(directory: Path) -> int:
         if f.is_file() and any(f.name.endswith(ext) for ext in RESUME_CHECK_EXTENSIONS):
             count += 1
     return count
+
+
+def _is_current_output_complete(directory: Path) -> bool:
+    """Return whether a case has every required current-format artifact."""
+    return all((directory / relative_path).is_file()
+               for relative_path in CURRENT_REQUIRED_OUTPUTS)
+
+
+def _acquire_batch_lock(output_root: Path):
+    """Acquire a process lock for an output root (Linux/HIVE/WSL)."""
+    lock_path = Path(str(output_root).rstrip("/\\") + ".batch.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.seek(0)
+        owner = lock_file.read().strip() or "unknown"
+        lock_file.close()
+        print(
+            f"  [FAIL] Another batch process (PID {owner}) is already "
+            f"using output root: {output_root}"
+        )
+        sys.exit(1)
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+
+    def _release() -> None:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
+        except Exception:
+            pass
+
+    atexit.register(_release)
+    return lock_file
 
 
 def _run_single_patient(
@@ -195,6 +248,7 @@ def main() -> None:
         if args.audit_csv
         else output_root / AUDIT_CSV_FILENAME
     )
+    _batch_lock = _acquire_batch_lock(output_root)
 
     # ---- Banner ----
     print("=" * 60)
@@ -302,8 +356,11 @@ def main() -> None:
         # Resume check (same logic as test_batch.sh)
         if args.resume and case_output.exists():
             existing = _count_output_files(case_output)
-            if existing > 0:
-                print(f"  SKIPPING (resume mode, {existing} output files already exist)")
+            if _is_current_output_complete(case_output):
+                print(
+                    "  SKIPPING (resume mode, complete current-format "
+                    f"output; {existing} image files)"
+                )
                 skipped += 1
                 # Still inspect and log unless the case was already logged
                 # in a previous run of this batch (prevents row duplication
@@ -324,6 +381,9 @@ def main() -> None:
                         print(f"  WARNING: audit log append failed for "
                               f"{patient_id}: {e}")
                 continue
+            if existing > 0:
+                print("  RERUNNING (incomplete or legacy output)")
+                shutil.rmtree(case_output)
 
         case_output.mkdir(parents=True, exist_ok=True)
 
@@ -373,25 +433,40 @@ def main() -> None:
     print(f"\n{'=' * 60}")
     print(f"  Batch processing complete")
     print(f"{'=' * 60}")
-    print(f"  Total: {total}  Succeeded: {succeeded}  Failed: {failed}  Skipped: {skipped}")
-    print(f"  Exit-code counters above reflect the container's raw return status.")
-    print(f"  For the full per-case outcome (including silent empty outputs)")
-    print(f"  inspect the audit CSV: {audit_csv}")
+    print(
+        f"  Total: {total}  Container exit 0: {succeeded}  "
+        f"Container non-zero: {failed}  Resume-skipped: {skipped}"
+    )
+    print(
+        "  Final success/failure is determined by the audit statuses below, "
+        "because the app can exit 0 after a silent selection failure."
+    )
     if failed_patients:
         print(f"\n  Failed patients (non-zero exit):")
         for p in failed_patients:
             print(f"    - {p}")
 
     # Per-status breakdown from the audit CSV.
+    audit_failure_count = 0
     if audit_csv.exists():
         status_counts = summarise(audit_csv)
         if status_counts:
             print(f"\n  Per-status breakdown from audit CSV:")
             for status in sorted(status_counts):
                 print(f"    {status:<24} {status_counts[status]:>5}")
+            audit_failure_count = sum(
+                count
+                for status, count in status_counts.items()
+                if status.startswith("FAIL_")
+            )
+            if audit_failure_count:
+                print(
+                    "\n  Guardrail result: FAILED "
+                    f"({audit_failure_count} case audit failure(s))"
+                )
     print()
 
-    if failed > 0:
+    if failed > 0 or audit_failure_count > 0:
         sys.exit(1)
 
 

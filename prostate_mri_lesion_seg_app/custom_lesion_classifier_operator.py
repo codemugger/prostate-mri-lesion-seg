@@ -55,6 +55,7 @@ redistributes the SOFTWARE, a copy of this Agreement must be included with
 each copy of the SOFTWARE.'''
 
 import logging
+import json
 from pathlib import Path
 import yaml
 import copy
@@ -82,6 +83,9 @@ import torch
 from resnet import ResNet, BasicBlock
 from common import standard_normalization_multi_channel
 from common import crop_pos_classification_multi_channel_3d
+from common import compute_prostate_measurements
+from dicom_sr_utils import generate_prostate_measurement_sr
+from rtstruct_utils import find_dicom_series_by_uid
 
 ###############################################################################
 class ProstateLesionClassifierOperator(Operator):
@@ -199,19 +203,41 @@ class ProstateLesionClassifierOperator(Operator):
         _, predicted = torch.max(outputs.data, 1)
         predicted = predicted.cpu().numpy().squeeze()
 
-         # Write prostate organ information
-        nda_wp = data["pred_wp"]
-        nda_wp = nda_wp.squeeze()
-        nda_regions = label(nda_wp)
-        regions = np.unique(nda_regions)
-        nda_region = (nda_regions==regions[0]).astype(np.uint8)
-        props = regionprops(nda_region)
+         # Write prostate organ information — using CLEANED organ mask for
+        # accurate volume/dimensions (without erroneous islands).
+        cleaned_organ_path = self.output_folder / "organ" / "cleaned_organ.nii.gz"
+        if cleaned_organ_path.exists():
+            cleaned_nib = nib.load(str(cleaned_organ_path))
+            cleaned_data = cleaned_nib.get_fdata()
+            measurements = compute_prostate_measurements(
+                cleaned_data,
+                affine=cleaned_nib.affine,
+            )
+        else:
+            # Fallback to raw organ data from the pipeline if cleaned doesn't exist
+            cleaned_data = data["pred_wp"].squeeze()
+            self.logger.warning(
+                "cleaned_organ.nii.gz not found; computing measurements from "
+                "raw organ mask using the T2 affine."
+            )
+            measurements = compute_prostate_measurements(
+                cleaned_data,
+                affine=affine,
+            )
 
         info = {}
         info_file = []
         info["Organ"] = "Prostate"
-        info["Major_Axis_Length"] = props[0].major_axis_length * 0.5
-        info["Volume"] = float(np.sum(nda_wp.astype(np.uint16))) * 0.5 * 0.5 * 0.5
+        info["Volume_mm3"] = measurements["volume_mm3"]
+        info["Volume_cc"] = measurements["volume_cc"]
+        info["Dimensions_mm"] = {
+            "Left_Right": measurements["left_right_mm"],
+            "Anterior_Posterior": measurements["anterior_posterior_mm"],
+            "Superior_Inferior": measurements["superior_inferior_mm"],
+        }
+        info["Dimension_1_mm"] = measurements["dimensions_mm"][0]
+        info["Dimension_2_mm"] = measurements["dimensions_mm"][1]
+        info["Dimension_3_mm"] = measurements["dimensions_mm"][2]
         print(info)
         info_file.append(info)
 
@@ -238,8 +264,54 @@ class ProstateLesionClassifierOperator(Operator):
             print(info)
             info_file.append(info)
 
-        with open(self.output_folder / "lesions.txt" , "w") as out_file:
+        with open(self.output_folder / "lesions.txt", "w") as out_file:
             _ = yaml.dump(info_file, stream=out_file)
+
+        # Create a standards-based DICOM Comprehensive SR (TID 1500 Imaging
+        # Measurement Report) beside lesions.txt. It references the exact T2
+        # MR series selected by the pipeline and remains UNVERIFIED.
+        cleanup_metrics = None
+        cleanup_metrics_path = (
+            self.output_folder / "organ" / "cleanup_metrics.json"
+        )
+        if cleanup_metrics_path.exists():
+            with open(
+                cleanup_metrics_path,
+                "r",
+                encoding="utf-8",
+            ) as metrics_file:
+                cleanup_metrics = json.load(metrics_file)
+
+        t2_dicom_series_path = self.output_folder / "dicom" / "t2"
+        if not any(t2_dicom_series_path.glob("*.dcm")):
+            t2_series_uid = input_image_t2.metadata().get("SeriesInstanceUID")
+            matched_path = find_dicom_series_by_uid(
+                Path(self.app_context.input_path),
+                str(t2_series_uid) if t2_series_uid else "",
+            )
+            if matched_path is not None:
+                t2_dicom_series_path = matched_path
+
+        sr_output_path = (
+            self.output_folder / "prostate_measurements_SR.dcm"
+        )
+        try:
+            if sr_output_path.exists():
+                sr_output_path.unlink()
+            generate_prostate_measurement_sr(
+                dicom_series_path=t2_dicom_series_path,
+                output_path=sr_output_path,
+                measurements=measurements,
+                cleanup_metrics=cleanup_metrics,
+            )
+        except Exception as exc:
+            # Preserve segmentation/classification outputs even when malformed
+            # source DICOM prevents SR construction. The audit CSV marks the
+            # missing SR as a reporting failure for review.
+            self.logger.exception(
+                "Failed to generate prostate measurement DICOM SR: %s",
+                exc,
+            )
 
         # Now emit data to the output ports of this operator
         op_output.emit(self.output_folder, self.output_name_saved_images_folder)

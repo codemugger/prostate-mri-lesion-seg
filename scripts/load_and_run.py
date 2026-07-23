@@ -228,15 +228,29 @@ def main() -> None:
     print()
     expected_outputs = [
         "t2/t2.nii.gz", "adc/adc.nii.gz", "highb/highb.nii.gz",
-        "organ/organ.nii.gz",
+        "organ/organ.nii.gz", "organ/cleaned_organ.nii.gz",
+        "organ/cleanup_metrics.json",
+        "organ/organ_RTSTRUCT.dcm",
+        "organ/cleaned_organ_RTSTRUCT.dcm",
         "lesion/lesion_mask.nii.gz", "lesion/merged_lesion_prob.nii.gz",
-        "lesions.txt",
+        "lesion/lesion_RTSTRUCT.dcm",
+        "lesions.txt", "prostate_measurements_SR.dcm",
+        "combined_organ_lesion_RTSTRUCT.dcm",
     ]
+    missing_outputs = []
     for f in expected_outputs:
         full = output_path / f
         status = "OK" if full.exists() else "MISSING"
         print(f"  [{status}] {f}")
+        if not full.exists():
+            missing_outputs.append(f)
     print()
+    if missing_outputs:
+        print(
+            "  [FAIL] Container exited successfully but required output "
+            "artifacts are missing."
+        )
+        sys.exit(2)
 
 
 if __name__ == "__main__":

@@ -56,6 +56,7 @@ each copy of the SOFTWARE.'''
 
 import os
 import copy
+import json
 import logging
 import numpy as np
 
@@ -80,6 +81,7 @@ from torch.utils.data import Dataset
 # Local imports
 from rrunet3D import RRUNet3D
 from common import standard_normalization_multi_channel
+from common import clean_organ_mask
 from rtstruct_utils import generate_rtstruct_files, find_dicom_series_by_uid
 
 def bbox2_3D(img):
@@ -164,8 +166,11 @@ class SegmentationDataset(Dataset):
         nda = np.stack(nda, axis=0).astype(np.float32)
         nda_shape = nda.shape[1:]
 
-        # Load prostate segmentation
-        wp_path = f"{self.output_path}/organ/organ.nii.gz"
+        # Load prostate segmentation (use cleaned version for ROI computation)
+        wp_path = f"{self.output_path}/organ/cleaned_organ.nii.gz"
+        if not os.path.exists(wp_path):
+            # Fallback to original if cleaned doesn't exist (shouldn't happen in normal flow)
+            wp_path = f"{self.output_path}/organ/organ.nii.gz"
         wp_nib = nib.as_closest_canonical(nib.load(wp_path))
         nda_wp = (self._ensure_nib_3d(wp_nib.get_fdata()) > 0.0).astype(np.float32)
 
@@ -312,6 +317,41 @@ class ProstateLesionSegOperator(Operator):
                 meta["affine"] = np.eye(4)
 
         self.convert_and_save(input_image_t2, input_image_adc, input_image_highb, image_organ_seg, self.output_folder)
+
+        # --- Organ mask cleanup ---
+        # The original organ.nii.gz is already saved by convert_and_save().
+        # Now produce a cleaned version that removes erroneous disconnected
+        # islands and fills holes.  The cleaned mask is used for ALL downstream
+        # processing (lesion ROI, post-masking, combined RTSTRUCT).
+        # The original is retained for radiologist reference.
+        organ_nii_path = Path(self.output_folder) / "organ" / "organ.nii.gz"
+        cleaned_organ_nii_path = Path(self.output_folder) / "organ" / "cleaned_organ.nii.gz"
+        if organ_nii_path.exists():
+            organ_nib = nib.load(str(organ_nii_path))
+            organ_data_raw = np.rint(organ_nib.get_fdata()).astype(np.uint8)
+            cleaned_organ_data, cleanup_metrics = clean_organ_mask(
+                organ_data_raw,
+                fill_holes=True,
+                return_metrics=True,
+            )
+            cleaned_header = organ_nib.header.copy()
+            cleaned_header.set_data_dtype(np.uint8)
+            nib.save(
+                nib.Nifti1Image(
+                    cleaned_organ_data,
+                    organ_nib.affine,
+                    header=cleaned_header,
+                ),
+                str(cleaned_organ_nii_path),
+            )
+            cleanup_metrics_path = (
+                Path(self.output_folder) / "organ" / "cleanup_metrics.json"
+            )
+            with open(cleanup_metrics_path, "w", encoding="utf-8") as metrics_file:
+                json.dump(cleanup_metrics, metrics_file, indent=2, sort_keys=True)
+            self.logger.info("Saved cleaned organ mask: %s", cleaned_organ_nii_path)
+        else:
+            self.logger.warning("organ.nii.gz not found at %s; skipping cleanup.", organ_nii_path)
 
         # Guard: skip lesion inference when the organ model found no prostate.
         # When the organ mask is empty the model has nothing to segment within,
@@ -697,8 +737,11 @@ class ProstateLesionSegOperator(Operator):
         nda_prob = nda_prob / (len(tags))
         nib.save(nib.Nifti1Image(nda_prob, affine), str(output_path) + "/lesion/" + "merged_lesion_prob.nii.gz")
 
-        # Outlier rejection based on original prostate segmentation
-        nda_wp = nib.load(str(output_path) + "/organ/organ.nii.gz").get_fdata()
+        # Outlier rejection based on CLEANED prostate segmentation
+        cleaned_organ_path = str(output_path) + "/organ/cleaned_organ.nii.gz"
+        if not os.path.exists(cleaned_organ_path):
+            cleaned_organ_path = str(output_path) + "/organ/organ.nii.gz"
+        nda_wp = nib.load(cleaned_organ_path).get_fdata()
         nda_wp = np.squeeze(nda_wp)
         nda_prob = np.multiply(nda_prob, nda_wp.astype(np.float32))
 
@@ -712,6 +755,11 @@ class ProstateLesionSegOperator(Operator):
         # threshold = 0.6344772701607316
         threshold = 0.63
         nda_prob = (nda_prob >= threshold).astype(np.uint8)
+
+        # Do not remove lesion components without a clinically validated
+        # minimum-volume threshold. Multifocal and very small true lesions are
+        # possible; preserving the established lesion output prevents an
+        # unvalidated post-processing rule from changing PI-RADS results.
         nib.save(nib.Nifti1Image(nda_prob, affine), str(output_path) + "/lesion/" + "lesion_mask.nii.gz")
 
         # Check if lesion_mask is all 0's

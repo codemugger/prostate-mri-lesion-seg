@@ -31,17 +31,21 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
   - `output/adc/adc.nii.gz`
   - `output/highb/highb.nii.gz`
 - Prostate organ segmentation (multi-class: background, TZ, PZ)
-  - `output/organ/organ.nii.gz` (multi-class mask: 0=background, 1=TZ, 2=PZ)
+  - `output/organ/organ.nii.gz` (original multi-class mask: 0=background, 1=TZ, 2=PZ — kept for reference/review)
+  - `output/organ/cleaned_organ.nii.gz` (cleaned mask: erroneous islands removed, holes filled — used for all downstream processing)
+  - `output/organ/cleanup_metrics.json` (component counts, removed/fill voxel counts, largest-component fraction)
 - Lesion segmentation (per-fold and merged probabilities + final mask)
   - `output/lesion/fold{0..4}_lesion_prob.nii.gz` (5 folds)
   - `output/lesion/merged_lesion_prob.nii.gz`
-  - `output/lesion/lesion_mask.nii.gz` (binary mask, post-processed)
+  - `output/lesion/lesion_mask.nii.gz` (binary mask; no component-size filtering is applied without clinical validation)
 - Lesion report with PI‑RADS and lesion statistics
-  - `output/lesions.txt` (YAML: per-lesion PI‑RADS, major axis length, volume, plus organ stats)
+  - `output/lesions.txt` (YAML: per-lesion PI‑RADS, major axis length, volume; prostate volume in mm³/cc and LR/AP/SI dimensions in mm)
+  - `output/prostate_measurements_SR.dcm` (DICOM Comprehensive SR / TID 1500 measurement report; COMPLETE, UNVERIFIED)
 - RTSTRUCT files (DICOM RT Structure Set), all referenced against the pipeline-selected T2 DICOM series
-  - `output/organ/organ_RTSTRUCT.dcm` — organ zones only (ROIs: `Prostate_TZ` blue, `Prostate_PZ` yellow; or `Prostate` green if binary)
+  - `output/organ/organ_RTSTRUCT.dcm` — original organ zones (kept for reference/review by radiologists)
+  - `output/organ/cleaned_organ_RTSTRUCT.dcm` — cleaned organ zones (islands removed, clinically accurate)
   - `output/lesion/lesion_RTSTRUCT.dcm` — lesion contours only (ROI: `Lesion` red)
-  - `output/combined_organ_lesion_RTSTRUCT.dcm` — **combined** organ zones + lesion contours in a single file for convenient loading in clinical viewers (e.g. CARPL)
+  - `output/combined_organ_lesion_RTSTRUCT.dcm` — **combined** cleaned organ zones + lesion contours in a single file for convenient loading in clinical viewers (e.g. CARPL)
 - Copies of the pipeline-selected DICOM series (for importing alongside RTSTRUCTs into a viewer)
   - `output/dicom/t2/` — T2 DICOM files
   - `output/dicom/adc/` — ADC DICOM files
@@ -60,27 +64,33 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
 - Save `output/organ/organ.nii.gz` as a multi-class mask (background/TZ/PZ).
 
 3) **Lesion segmentation (ensemble, organ-masked)**
+- **Organ mask cleanup** (new): after saving the original `organ.nii.gz`, produce `cleaned_organ.nii.gz` by removing disconnected islands (keep largest connected component) and filling holes. The cleaned mask is used for all downstream processing; the original is retained for radiologist reference.
 - If the organ mask is empty (no prostate detected), lesion inference is skipped and an all-zero `lesion_mask.nii.gz` is written.
 - Save T2/ADC/HIGHB/organ as NIfTI for reproducible preprocessing.
 - Align ADC/HIGHB to T2 geometry; resample all to 0.5 mm isotropic.
-- Compute ROI from the organ mask with a 32‑voxel margin and crop volumes to the ROI.
+- Compute ROI from the **cleaned** organ mask with a 32‑voxel margin and crop volumes to the ROI.
 - Run a 5‑fold 3D RR‑UNet ensemble on the ROI, accumulate and average per-voxel probabilities.
 - Parallel inference across all 5 folds using `ThreadPoolExecutor`.
-- Multiply merged probabilities by the organ mask (remove out-of-prostate predictions).
+- Multiply merged probabilities by the **cleaned** organ mask (remove out-of-prostate predictions).
 - Threshold with a fixed value (0.63) → `lesion_mask.nii.gz`.
+- Lesion components are not size-filtered: a safe minimum clinically significant volume has not yet been validated, and multifocal/small lesions must not be removed automatically.
 
 4) **Lesion classification (PI‑RADS)**
 - Resample T2/ADC/HIGHB/organ/lesion to 0.5 mm.
 - Extract centered 64×64×64 crops around each connected component in the lesion mask.
 - Classify crops using a lightweight 3D ResNet; map class index {0..3} → PI‑RADS {2..5}.
 - Rule-based adjustment: if predicted=2 (PI‑RADS 4) and major axis length > 40 mm, upgrade to predicted=3 (PI‑RADS 5).
+- **Prostate measurements**: compute true mask volume from the NIfTI affine determinant and physical LR/AP/SI bounding extents in RAS coordinates from the cleaned organ mask.
 - Write lesion and organ stats to `output/lesions.txt`.
+- Write the same prostate measurements to `output/prostate_measurements_SR.dcm`, a standards-based DICOM Comprehensive SR that references the selected T2 MR series. Algorithm outputs are marked COMPLETE but UNVERIFIED and not FINAL.
 
 5) **RTSTRUCT generation and DICOM export**
-- Generate three DICOM RT Structure Sets from the NIfTI masks, all referenced against the pipeline-selected T2 DICOM series (matched by `SeriesInstanceUID`):
-  - `organ_RTSTRUCT.dcm` — organ zones (TZ/PZ or whole prostate).
+- Generate four DICOM RT Structure Sets from the NIfTI masks, all referenced against the pipeline-selected T2 DICOM series (matched by `SeriesInstanceUID`):
+  - `organ_RTSTRUCT.dcm` — original organ zones (for reference/review).
+  - `cleaned_organ_RTSTRUCT.dcm` — cleaned organ zones (islands removed, clinically accurate).
   - `lesion_RTSTRUCT.dcm` — lesion contour(s).
-  - `combined_organ_lesion_RTSTRUCT.dcm` — all organ + lesion ROIs in a single file.
+  - `combined_organ_lesion_RTSTRUCT.dcm` — cleaned organ + lesion ROIs in a single file.
+- Contours use standards-based `CLOSEDPLANAR_XOR` encoding with pinhole/keyhole cuts disabled. Point- or line-like components are represented as valid sub-pixel polygons instead of being discarded, and contour approximation is disabled so the RTSTRUCT rasterizes exactly back to the exported mask.
 - Copy the pipeline-selected DICOM files for T2, ADC, and HIGHB into `output/dicom/` so radiologists can import DICOMs and RTSTRUCTs together into a viewer.
 
 
@@ -132,11 +142,12 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
   - Reconstruct to original size and save per-fold probability maps; average to `merged_lesion_prob.nii.gz`.
   - Parallel inference across all 5 folds using `ThreadPoolExecutor`.
 - Post-processing:
-  - Multiply merged probabilities by the organ mask (removes non-prostate detections).
+  - Multiply merged probabilities by the cleaned organ mask (removes non-prostate detections).
   - Fixed threshold (0.63) → `lesion_mask.nii.gz`.
 - RTSTRUCT and DICOM export (runs after lesion inference):
-  - Generates three RTSTRUCT files via `rtstruct_utils.generate_rtstruct_files()` — organ, lesion, and combined (see Outputs above).
+  - Generates four RTSTRUCT files via `rtstruct_utils.generate_rtstruct_files()` — original organ, cleaned organ, lesion, and combined (see Outputs above).
   - RTSTRUCTs are built from the exact T2 DICOM series the pipeline selected, matched by `SeriesInstanceUID` (not heuristic folder-name matching).
+  - Separate `CLOSEDPLANAR_XOR` contours preserve inner/outer boundaries without the visible connector lines produced by `rt-utils` pinhole encoding. Degenerate OpenCV contours are repaired into valid pixel-footprint polygons and round-trip checked by the validation harness.
   - SGH de-identified data often lacks the `StudyID` tag `(0020,0010)`, which crashes `rt_utils`. The code automatically patches `StudyID` from `AccessionNumber` in a temporary copy of the DICOM files.
   - Copies the pipeline-selected T2, ADC, and HIGHB DICOM series into `output/dicom/{t2,adc,highb}/` so radiologists can import DICOMs + RTSTRUCTs together into a viewer. For HIGHB, only the highest b‑value files are copied.
 
@@ -154,7 +165,8 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
   - Predict class index ∈ {0..3}; PI‑RADS = index + 2.
   - If predicted=2 (PI‑RADS 4) and major axis > 40 mm → promote to PI‑RADS 5.
 - Reporting:
-  - `lesions.txt` includes per-lesion ID, major axis length (mm), volume (mm³), PI‑RADS, plus prostate organ stats.
+  - `lesions.txt` includes per-lesion ID, major axis length (mm), volume (mm³), PI‑RADS, plus cleaned-prostate volume and LR/AP/SI dimensions.
+  - `prostate_measurements_SR.dcm` encodes prostate dimensions and volume as a DICOM TID 1500 Imaging Measurement Report using UCUM units. It references the selected T2 evidence and is explicitly UNVERIFIED.
 
 
 ## How to run
@@ -227,6 +239,12 @@ python scripts/build_and_save.py
 # Produces docker/docker_image.tar (~4–6 GB)
 ```
 
+Docker images are immutable snapshots of the application code. After changing
+the pipeline, rebuild `docker/docker_image.tar`, transfer that new tar to the
+target machine/HIVE, and load it before inference. An older already-loaded
+image — including one selected with `--skip-load` — will continue to generate
+the older outputs.
+
 **Load and run a single patient:**
 
 ```bash
@@ -263,11 +281,35 @@ The Docker image uses NVIDIA CUDA 12.4 + cuDNN runtime (Ubuntu 22.04, Python 3.1
 ./scripts/test_batch.sh -i /data/patients/ -o /output/ -m models/ -r --cooldown 30
 ```
 
+Local batch runs execute the application directly from
+`prostate_mri_lesion_seg_app/`, so every newly processed case uses the current
+source code. Existing outputs are not modified retroactively.
+
+To verify a pipeline revision, use a new output directory without `-r`:
+
+```bash
+bash ./scripts/test_batch.sh \
+    -i test-data/ \
+    -o output_golf/ \
+    -m models/ \
+    --cooldown 10
+```
+
+Running without `-r` is a fresh batch and clears the selected output root
+before processing. Do not point it at results that must be retained.
+
 Batch processing features:
-- **Resume mode** (`-r`): skips patients that already have output files (NIfTI or DCM).
+- **Resume mode** (`-r`): skips complete cases based on required artifact presence; incomplete/legacy outputs are cleared and rerun. Resume cannot identify an internal format revision when all expected files already exist. For example, a complete case containing an older keyhole RTSTRUCT will be skipped rather than regenerated with `CLOSEDPLANAR_XOR`. Use a new output root, run a fresh batch without `-r`, or remove the specific case directory before resuming.
 - **Cooldown** (`--cooldown SECS`): pauses between cases to prevent thermal issues (default 30 s).
-- **Audit CSV** (`--audit-csv PATH`): writes a per-case status CSV (default `<output>/batch_audit_log.csv`) with status classification, missing modalities, elapsed time, and file presence flags.
-- Status vocabulary: `SUCCESS_COMPLETE`, `SUCCESS_EMPTY_LESION`, `FAIL_MISSING_MODALITY`, `FAIL_ORGAN_SEG`, `FAIL_LESION_SEG`, `FAIL_CLASSIFIER`, `FAIL_RUNTIME`, `FAIL_EMPTY_OUTPUT`, `SKIPPED_RESUME`.
+- **Single-writer lock**: rejects a second batch targeting the same output root, preventing output/audit corruption.
+- **Audit CSV** (`--audit-csv PATH`): writes status, missing modalities, cleanup metrics, elapsed time, and file-presence flags (default `<output>/batch_audit_log.csv`).
+- **Final guardrail exit**: the batch exits non-zero if any audit status is `FAIL_*`, even when every underlying MONAI invocation returned exit code 0.
+- Status vocabulary: `SUCCESS_COMPLETE`, `SUCCESS_EMPTY_LESION`, `FAIL_MISSING_MODALITY`, `FAIL_ORGAN_SEG`, `FAIL_POSTPROCESSING`, `FAIL_LESION_SEG`, `FAIL_CLASSIFIER`, `FAIL_REPORTING`, `FAIL_RTSTRUCT`, `FAIL_RUNTIME`, `FAIL_EMPTY_OUTPUT`, `SKIPPED_RESUME`.
+
+In summary:
+- A new local inference run produces the latest outputs, including no-keyhole `CLOSEDPLANAR_XOR` RTSTRUCTs.
+- A Docker/HIVE inference run produces them only after rebuilding and loading the updated image.
+- A complete case skipped by `-r` keeps its existing files and encoding.
 
 ### Using this Repository
 
@@ -357,7 +399,7 @@ This calls `scripts/eval_dice.py` under the hood (loads two NIfTI files, compute
   - Lesion segmentation is both ROI‑focused and organ‑masked for fewer false positives.
 - 5‑fold ensemble improves lesion robustness and calibration; fold probabilities are exported for transparency.
 - PI‑RADS classification uses 3D crops and a size-based rule to better separate 4 vs. 5.
-- Clear, audit-friendly artifacts: NIfTI inputs/outputs, merged probabilities, final masks, three RTSTRUCT files (organ, lesion, combined), copied DICOM series, and a concise YAML report.
+- Clear, audit-friendly artifacts: NIfTI inputs/outputs, cleanup metrics, merged probabilities, final masks, four RTSTRUCT files, copied DICOM series, YAML report, and DICOM SR.
 - Combined RTSTRUCT merges organ zones and lesion contours into a single DICOM RT Structure Set for convenient viewing in clinical DICOM viewers (e.g. CARPL).
 - Batch pipeline includes per-case audit CSV with structured status classification, enabling systematic quality review over large cohorts.
 
@@ -371,6 +413,7 @@ This calls `scripts/eval_dice.py` under the hood (loads two NIfTI files, compute
 - High b‑value filter operator: `prostate_mri_lesion_seg_app/highb_filter_operator.py`
 - Models: `prostate_mri_lesion_seg_app/rrunet3D.py`, `prostate_mri_lesion_seg_app/resnet.py`
 - Utilities: `prostate_mri_lesion_seg_app/common.py`, `prostate_mri_lesion_seg_app/rtstruct_utils.py`
+- DICOM SR export: `prostate_mri_lesion_seg_app/dicom_sr_utils.py`
 - Training: `training/engine.py`, `training/train_organ.py`, `training/train_lesion.py`
 - Docker: `docker/Dockerfile`, `docker/docker-compose.yaml`, `docker/requirements.txt`
 - Scripts: see [Scripts](#scripts) section below
@@ -380,10 +423,14 @@ This calls `scripts/eval_dice.py` under the hood (loads two NIfTI files, compute
 
 - Confirm outputs exist:
   - `output/t2/t2.nii.gz`, `output/adc/adc.nii.gz`, `output/highb/highb.nii.gz`
-  - `output/organ/organ.nii.gz` (multi-class: 0=background, 1=TZ, 2=PZ)
+  - `output/organ/organ.nii.gz` (original, multi-class: 0=background, 1=TZ, 2=PZ)
+  - `output/organ/cleaned_organ.nii.gz` (cleaned: islands removed, holes filled)
+  - `output/organ/cleanup_metrics.json` (cleanup audit)
   - `output/lesion/fold*_lesion_prob.nii.gz`, `output/lesion/merged_lesion_prob.nii.gz`, `output/lesion/lesion_mask.nii.gz`
-  - `output/lesions.txt` (PI‑RADS per lesion)
-  - `output/organ/organ_RTSTRUCT.dcm`, `output/lesion/lesion_RTSTRUCT.dcm`, `output/combined_organ_lesion_RTSTRUCT.dcm` (if RTSTRUCT generation succeeds)
+  - `output/lesions.txt` (PI‑RADS per lesion, prostate volume in mm³/cc, 3 orthogonal dimensions)
+  - `output/prostate_measurements_SR.dcm` (DICOM SR, COMPLETE/UNVERIFIED)
+  - `output/organ/organ_RTSTRUCT.dcm` (original), `output/organ/cleaned_organ_RTSTRUCT.dcm` (cleaned)
+  - `output/lesion/lesion_RTSTRUCT.dcm`, `output/combined_organ_lesion_RTSTRUCT.dcm` (uses cleaned organ)
   - `output/dicom/t2/`, `output/dicom/adc/`, `output/dicom/highb/` (copies of pipeline-selected DICOM series)
 - For batch runs, inspect the audit CSV (`batch_audit_log.csv`) for per-case status:
   ```bash
@@ -413,7 +460,14 @@ There are several scripts to help with running, validation, deployment, and deve
 
 - `scripts/compare_output.sh`: Computes organ and lesion DICE scores for two output directories.
 - `scripts/eval_dice.py`: Loads two NIfTI files and computes mean DICE (called by `compare_output.sh`).
+- `scripts/compare_batch_outputs.py`: Produces a per-case CSV and JSON regression summary for a new batch versus a prior output. It checks input/original-organ identity, quantifies cleaned-organ and lesion changes, and validates each generated DICOM SR against its T2 study.
+- `scripts/validate_rtstruct_outputs.py`: Strictly validates all four RTSTRUCTs per case: SOP/study/T2 references, ROI names, `CLOSEDPLANAR_XOR` use, minimum polygon geometry, DICOM short-string limits, and exact RTSTRUCT-to-NIfTI voxel round trips.
 - `scripts/validate_selection_rules.py`: Validates T2/ADC/HIGHB selection rules (from `app.py`) against an annotated ground-truth CSV. Reports precision, recall, F1, and lists false positives / negatives per class.
+- `tests/`: standard-library `unittest` guardrails for connected-component cleanup, hole filling, affine-aware measurements, DICOM SR parsing, exact no-keyhole RTSTRUCT round trips, and audit status classification:
+  ```bash
+  python -m unittest discover -s tests -v
+  python scripts/validate_rtstruct_outputs.py output/
+  ```
 
 ### Data investigation
 

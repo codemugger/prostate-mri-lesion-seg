@@ -60,11 +60,15 @@ EXPECTED_FILES: "dict[str, str]" = {
     "adc_nii":             "adc/adc.nii.gz",
     "highb_nii":           "highb/highb.nii.gz",
     "organ_nii":           "organ/organ.nii.gz",
+    "cleaned_organ_nii":   "organ/cleaned_organ.nii.gz",
+    "cleanup_metrics":     "organ/cleanup_metrics.json",
     "organ_rtstruct":      "organ/organ_RTSTRUCT.dcm",
+    "cleaned_organ_rtstruct": "organ/cleaned_organ_RTSTRUCT.dcm",
     "lesion_mask":         "lesion/lesion_mask.nii.gz",
     "lesion_rtstruct":     "lesion/lesion_RTSTRUCT.dcm",
     "merged_lesion_prob":  "lesion/merged_lesion_prob.nii.gz",
     "lesions_txt":         "lesions.txt",
+    "prostate_sr":         "prostate_measurements_SR.dcm",
     "combined_rtstruct":   "combined_organ_lesion_RTSTRUCT.dcm",
 }
 
@@ -85,13 +89,23 @@ CSV_COLUMNS: "list[str]" = [
     "has_adc_nii",
     "has_highb_nii",
     "has_organ_nii",
+    "has_cleaned_organ_nii",
+    "has_cleanup_metrics",
     "has_organ_rtstruct",
+    "has_cleaned_organ_rtstruct",
     "has_lesion_mask",
     "has_lesion_rtstruct",
     "has_merged_lesion_prob",
     "has_lesion_folds",
     "has_lesions_txt",
+    "has_prostate_sr",
     "has_combined_rtstruct",
+    "organ_cleanup_status",
+    "organ_island_count_before",
+    "organ_removed_island_count",
+    "organ_removed_voxels",
+    "organ_filled_hole_voxels",
+    "organ_largest_component_fraction",
     "output_file_count",
     "input_dir",
     "output_dir",
@@ -104,8 +118,11 @@ class Status:
     SUCCESS_EMPTY_LESION  = "SUCCESS_EMPTY_LESION"   # organ empty -> zero mask
     FAIL_MISSING_MODALITY = "FAIL_MISSING_MODALITY"  # selector rejected input
     FAIL_ORGAN_SEG        = "FAIL_ORGAN_SEG"         # no organ.nii.gz
+    FAIL_POSTPROCESSING   = "FAIL_POSTPROCESSING"    # cleaned organ/metrics missing
     FAIL_LESION_SEG       = "FAIL_LESION_SEG"        # no lesion_mask.nii.gz
     FAIL_CLASSIFIER       = "FAIL_CLASSIFIER"        # no lesions.txt
+    FAIL_REPORTING        = "FAIL_REPORTING"         # no DICOM SR
+    FAIL_RTSTRUCT         = "FAIL_RTSTRUCT"          # one or more RTSTRUCTs missing
     FAIL_RUNTIME          = "FAIL_RUNTIME"           # non-zero exit code
     FAIL_EMPTY_OUTPUT     = "FAIL_EMPTY_OUTPUT"      # exit 0 but nothing at all
     SKIPPED_RESUME        = "SKIPPED_RESUME"         # already-present output
@@ -122,6 +139,7 @@ class CaseStatus:
     elapsed_seconds: Optional[float] = None
     resume_skipped: bool = False
     file_flags: "dict[str, bool]" = field(default_factory=dict)
+    cleanup_metrics: "dict[str, object]" = field(default_factory=dict)
     output_file_count: int = 0
     input_dir: str = ""
     output_dir: str = ""
@@ -140,6 +158,24 @@ class CaseStatus:
                 else f"{self.elapsed_seconds:.2f}"
             ),
             "resume_skipped": "true" if self.resume_skipped else "false",
+            "organ_cleanup_status": str(
+                self.cleanup_metrics.get("status", "")
+            ),
+            "organ_island_count_before": str(
+                self.cleanup_metrics.get("original_component_count", "")
+            ),
+            "organ_removed_island_count": str(
+                self.cleanup_metrics.get("removed_island_count", "")
+            ),
+            "organ_removed_voxels": str(
+                self.cleanup_metrics.get("removed_voxels", "")
+            ),
+            "organ_filled_hole_voxels": str(
+                self.cleanup_metrics.get("filled_hole_voxels", "")
+            ),
+            "organ_largest_component_fraction": str(
+                self.cleanup_metrics.get("largest_component_fraction", "")
+            ),
             "output_file_count": str(self.output_file_count),
             "input_dir": self.input_dir,
             "output_dir": self.output_dir,
@@ -190,6 +226,25 @@ def inspect_case(
         (case_output_dir / rel).is_file() for rel in LESION_FOLD_FILES
     )
 
+    cleanup_metrics: "dict[str, object]" = {}
+    metrics_path = case_output_dir / EXPECTED_FILES["cleanup_metrics"]
+    if metrics_path.is_file():
+        try:
+            with open(metrics_path, encoding="utf-8") as metrics_file:
+                cleanup_metrics = json.load(metrics_file)
+            if int(cleanup_metrics.get("original_foreground_voxels", 0)) == 0:
+                cleanup_metrics["status"] = "EMPTY"
+            elif (
+                int(cleanup_metrics.get("removed_voxels", 0)) > 0
+                or int(cleanup_metrics.get("filled_hole_voxels", 0)) > 0
+            ):
+                cleanup_metrics["status"] = "CLEANED"
+            else:
+                cleanup_metrics["status"] = "UNCHANGED"
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            flags["cleanup_metrics"] = False
+            cleanup_metrics = {"status": "INVALID"}
+
     file_count = 0
     if case_output_dir.exists():
         for p in case_output_dir.rglob("*"):
@@ -228,6 +283,7 @@ def inspect_case(
         elapsed_seconds=elapsed_seconds,
         resume_skipped=resume_skipped,
         file_flags=flags,
+        cleanup_metrics=cleanup_metrics,
         output_file_count=file_count,
         input_dir=str(input_dir) if input_dir else "",
         output_dir=str(case_output_dir),
@@ -246,10 +302,14 @@ def _describe_file_state(
         return f"Missing modality NIfTIs: {', '.join(missing_mods)}."
     if not flags["organ_nii"]:
         return "Modality NIfTIs present but organ segmentation missing."
+    if not flags["cleaned_organ_nii"] or not flags["cleanup_metrics"]:
+        return "Original organ mask present but cleaned organ output missing."
     if not flags["lesion_mask"]:
         return "Organ segmentation present but lesion segmentation missing."
     if not flags["lesions_txt"]:
         return "Lesion mask present but classifier report (lesions.txt) missing."
+    if not flags["prostate_sr"]:
+        return "Text report present but prostate DICOM SR missing."
     return "Partial output present."
 
 
@@ -282,6 +342,13 @@ def _classify_from_files(
             "the organ segmentation operator did not produce output.",
         )
 
+    if not flags["cleaned_organ_nii"] or not flags["cleanup_metrics"]:
+        return (
+            Status.FAIL_POSTPROCESSING,
+            "Original organ mask exists but cleaned_organ.nii.gz or "
+            "cleanup_metrics.json is missing.",
+        )
+
     if not flags["lesion_mask"]:
         return (
             Status.FAIL_LESION_SEG,
@@ -295,11 +362,31 @@ def _classify_from_files(
             "is missing.",
         )
 
+    if not flags["prostate_sr"]:
+        return (
+            Status.FAIL_REPORTING,
+            "lesions.txt exists but prostate_measurements_SR.dcm is missing.",
+        )
+
+    rtstruct_flags = (
+        "organ_rtstruct",
+        "cleaned_organ_rtstruct",
+        "lesion_rtstruct",
+        "combined_rtstruct",
+    )
+    missing_rtstructs = [name for name in rtstruct_flags if not flags[name]]
+    if missing_rtstructs:
+        return (
+            Status.FAIL_RTSTRUCT,
+            "Missing expected RTSTRUCT output(s): "
+            + ", ".join(missing_rtstructs),
+        )
+
     if flags["merged_lesion_prob"] and flags["lesion_folds"]:
         return (
             Status.SUCCESS_COMPLETE,
-            "All modalities selected, organ segmented, lesion inference "
-            "ran, classifier report produced.",
+            "All modalities selected; organ cleanup, lesion inference, "
+            "RTSTRUCT export, text report, and DICOM SR completed.",
         )
 
     return (
@@ -314,9 +401,36 @@ def _classify_from_files(
 # CSV audit log (append-safe, header-safe)
 # --------------------------------------------------------------------- #
 def append_csv_row(csv_path: "os.PathLike[str] | str", case: CaseStatus) -> None:
-    """Append one row to the audit CSV, writing the header if needed."""
+    """Append one row, migrating an older audit schema when necessary."""
     csv_path = Path(csv_path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if csv_path.exists() and csv_path.stat().st_size > 0:
+        with open(csv_path, newline="", encoding="utf-8") as existing_file:
+            reader = csv.DictReader(existing_file)
+            existing_columns = reader.fieldnames or []
+            if existing_columns != CSV_COLUMNS:
+                existing_rows = list(reader)
+                temporary_path = csv_path.with_suffix(csv_path.suffix + ".tmp")
+                with open(
+                    temporary_path,
+                    "w",
+                    newline="",
+                    encoding="utf-8",
+                ) as migrated_file:
+                    writer = csv.DictWriter(
+                        migrated_file,
+                        fieldnames=CSV_COLUMNS,
+                        extrasaction="ignore",
+                    )
+                    writer.writeheader()
+                    for row in existing_rows:
+                        writer.writerow({
+                            column: row.get(column, "")
+                            for column in CSV_COLUMNS
+                        })
+                temporary_path.replace(csv_path)
+
     write_header = (not csv_path.exists()) or csv_path.stat().st_size == 0
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
