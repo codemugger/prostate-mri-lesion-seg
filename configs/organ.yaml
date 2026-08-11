@@ -1,40 +1,29 @@
+# Binary whole-gland training. Build these files with scripts/prepare_training_data.py.
 dataset:
-  # For quick testing without predefined splits, set both CSVs to null and enable scan_all.
-  train_split_csv: null
-  val_split_csv: null
-  scan_all: true           # when true and CSVs are null/missing, scan directories and split internally
-  split_ratio: 0.8         # fraction for training; remainder used for validation
-  t2_dir: data/preprocessed/t2
-  label_dir: data/preprocessed/organ_masks
-  # Optional zone masks if you later choose to use them (not required for organ training)
-  pzone_dir: null
-  tzone_dir: null
-  cache_rate: 0.2
-  num_workers: 12
+  manifest: artifacts/training/training_manifest.csv
+  split_csv: artifacts/training/organ_splits.csv
+  cache_rate: 0.05
+  num_workers: 4
+  # null preserves the natural SGH/ProstateX cohort proportions. Optionally
+  # set explicit masses, e.g. {SGH: 0.8, ProstateX: 0.2}.
+  source_sampling_weights: null
 
+# Mirrors prostate_mri_lesion_seg_app/organ_seg_operator.py.
 preprocess:
-  spacing: [1.0, 1.0, 1.0]   # match inference operator spacing
-  roi_size: [128, 128, 16]   # matches app's sliding window ROI
-  samples_per_image: 2
-  pos_to_neg_ratio: 1.0      # balanced sampling around positives/negatives
+  spacing: [1.0, 1.0, 1.0]
+  patch_size: [128, 128, 16]
+  samples_per_case: 2
+  pos_to_neg_ratio: 1.0
 
+# This exact architecture is the deployed binary model.ts contract.
 model:
-  # type can be: "unet" (MONAI UNet) or "rrunet3d" (training/rrunet.py)
-  type: rrunet3d
-  in_channels: 1              # keep 1 (T2-only) unless you add ADC/HIGHB to the dataset
-  out_channels: 3             # background=0, TZ=1, PZ=2 (multi-class organ segmentation)
-  # UNet-only (ignored by rrunet3d):
+  type: unet
+  in_channels: 1
+  out_channels: 2
   channels: [16, 32, 64, 128, 256]
   strides: [2, 2, 2, 2]
   num_res_units: 2
-  # RRUNet3D-only:
-  blocks_down: "2,2,3,3"
-  blocks_up: "3,3,2"
-  num_init_kernels: 48
-  recurrent: true
-  residual: true
-  attention: true
-  se: true
+  norm: BATCH
 
 train:
   epochs: 200
@@ -44,49 +33,27 @@ train:
   amp: true
   seed: 42
   grad_accum_steps: 1
-  log_interval: 10
+  log_interval: 20
   val_interval: 1
-  deterministic: true
 
 loss:
-  type: dice_ce   # Dice + CrossEntropy
-  dice:
-    include_background: true
-    to_onehot_y: true
-    softmax: true
-  ce:
-    weight: null
+  include_background: false
+  dice_weight: 1.0
+  ce_weight: 1.0
 
 optimizer:
   type: adamw
 
 scheduler:
   type: cosine_anneal
-  t_max: 50
+  t_max: 200
   eta_min: 1.0e-6
 
 validation:
-  inferer_roi_size: [128, 128, 16]
-  inferer_sw_batch_size: 4
-  inferer_overlap: 0.5
-  # For organ segmentation, exclude background from dice calculation
-  # (focus on TZ and PZ segmentation quality)
-  include_background: false
+  roi_size: [128, 128, 16]
+  sw_batch_size: 4
+  overlap: 0.5
 
 output:
   exp_dir: experiments/organ
-  # Create a new subfolder per run: exp-001, exp-002, ...
-  per_run_subdir: true
-  # Enable TensorBoard logging
-  tensorboard: true
-  tb_subdir: tb
-  # Base names used for checkpoint files written inside the run subdir.
-  # The trainer will suffix these with epoch/exp/dice info.
-  best_checkpoint_name: best_model
-  last_checkpoint_name: last_model
-  metrics_csv: metrics.csv
-  # Save last checkpoint every N epochs (default: 1 = every epoch)
-  # Set to a higher value (e.g., 10) to save disk space, or set to epochs to only save at the end
-  save_last_interval: 10  # Save last checkpoint every 10 epochs (and always at final epoch)
-
-
+  save_last_interval: 1

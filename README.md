@@ -30,8 +30,8 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
   - `output/t2/t2.nii.gz`
   - `output/adc/adc.nii.gz`
   - `output/highb/highb.nii.gz`
-- Prostate organ segmentation (multi-class: background, TZ, PZ)
-  - `output/organ/organ.nii.gz` (original multi-class mask: 0=background, 1=TZ, 2=PZ — kept for reference/review)
+- Prostate whole-gland segmentation (binary: background/prostate)
+  - `output/organ/organ.nii.gz` (original binary whole-gland prediction)
   - `output/organ/cleaned_organ.nii.gz` (cleaned mask: erroneous islands removed, holes filled — used for all downstream processing)
   - `output/organ/cleanup_metrics.json` (component counts, removed/fill voxel counts, largest-component fraction)
 - Lesion segmentation (per-fold and merged probabilities + final mask)
@@ -61,7 +61,7 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
 2) **Organ segmentation (prostate)**
 - Preprocess T2: channel-first, RAS orientation, 1.0 mm isotropic resampling, intensity normalization.
 - Infer prostate mask with a packaged MONAI model (sliding-window) and invert transforms to the original space.
-- Save `output/organ/organ.nii.gz` as a multi-class mask (background/TZ/PZ).
+- Save `output/organ/organ.nii.gz` as a binary whole-gland mask.
 
 3) **Lesion segmentation (ensemble, organ-masked)**
 - **Organ mask cleanup** (new): after saving the original `organ.nii.gz`, produce `cleaned_organ.nii.gz` by removing disconnected islands (keep largest connected component) and filling holes. The cleaned mask is used for all downstream processing; the original is retained for radiologist reference.
@@ -121,8 +121,8 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
   - Model artifact: `models/organ/model.ts` (TorchScript).
   - Model loading: Operator looks for `model.ts` directly in the `model_path` directory.
 - Post-processing:
-  - Softmax → invert transforms → `AsDiscreted(argmax=True)` → multi-class prostate mask (background/TZ/PZ) in original space.
-  - The `argmax=True` parameter is critical to preserve all three classes (0=background, 1=TZ, 2=PZ); using only a threshold without argmax would collapse to binary.
+  - Softmax → invert transforms → `AsDiscreted(argmax=True)` → binary whole-gland mask in original space.
+  - The deployed TorchScript contract is two channels (background/prostate).
 
 ### Lesion segmentation (3D RR‑UNet ensemble, 5 folds)
 - Operator: `ProstateLesionSegOperator` (`prostate_mri_lesion_seg_app/custom_lesion_seg_operator.py`)
@@ -324,36 +324,119 @@ The current set of rules in `app.py` filter based on SeriesDescription and work 
 
 ## Training
 
-The repository includes training infrastructure for both organ and lesion segmentation models.
+Training is manifest-driven and intentionally separate from the working
+inference application. It mixes technically valid ProstateX cases with only
+radiologist-approved SGH cases, locks a held-out test set, records every
+exclusion, and never interprets a missing lesion mask as a negative label.
+
+### 1. Prepare the cohort, statistics, and locked splits
+
+```bash
+python scripts/prepare_training_data.py \
+  --audit-csv audit_assignments.csv \
+  --sgh-output-root "/path/to/Interesting outputs" \
+  --prostatex-root data/preprocessed \
+  --output-dir artifacts/training
+```
+
+SGH organ eligibility is `Reviewed=Y AND Q1=Y AND Q4=Y`. SGH lesion
+eligibility is `Reviewed=Y AND Q2=Y AND Q3=Y AND Q4=Y`. Before it is exposed
+to either trainer, every whole-gland label is binarized, reduced to its
+largest connected component, and hole-filled. Q5 blanks remain unknown.
+
+The preparation command writes:
+
+- `training_manifest.csv`, including source paths, audit decisions, technical
+  exclusions, scanner manufacturer/model, and study date.
+- `organ_splits.csv`, `lesion_splits.csv`, and the five lesion fold CSVs.
+- `audit_question_summary.csv`, plus breakdowns by manufacturer, model,
+  study date/year.
+- `audit_report.md/json` and `exclusions.csv`.
 
 ### Organ Segmentation Training
 
-- Notebook: `notebooks/train_organ.ipynb`
-- Model: Multi-class RRUNet3D (3 output channels: background, TZ, PZ)
-- Training script: `training/train_organ.py`
-- Configuration: `configs/organ.yaml`
-- 5-fold cross-validation training
-- Output: TorchScript model (`model.ts`) for deployment
+The organ model is a binary whole-gland MONAI UNet. Input is T2; ground truth
+is the cleaned organ mask. Its architecture and preprocessing match the
+current app. A strict, numerically checked `model.ts` is exported whenever a
+new best validation Dice is reached.
+
+```bash
+python -m training.train_organ --config configs/organ.yaml
+
+# Optional transfer learning from the current deployed model:
+python -m training.train_organ --config configs/organ.yaml \
+  --initial-weights models/organ/model.ts
+```
 
 ### Lesion Segmentation Training
 
-- Notebook: `notebooks/train_lesion.ipynb`
-- Model: Binary RRUNet3D (2 output channels: background, lesion)
-- Training script: `training/train_lesion.py`
-- Configuration: `configs/lesion.yaml`
-- 5-fold cross-validation training (ensemble)
-- Input: Multi-parametric (T2 + ADC + HIGHB, 3 channels)
-- ROI cropping with 32-voxel margin
-- Handles missing lesion masks (creates empty masks for patients without lesions)
+The lesion model uses T2+ADC+HIGHB input and the lesion mask as ground truth.
+Its alignment, 0.5-mm resampling, cleaned-organ ROI, normalization, RRUNet
+architecture, and multiple-of-32 tiling match deployed inference. Train the
+five locked folds independently:
 
-### Training Infrastructure
+```bash
+for fold in 0 1 2 3 4; do
+  python -m training.train_lesion --config configs/lesion.yaml --fold "$fold"
+done
+```
 
-- Training engine: `training/engine.py`
-- Datasets: `training/datasets.py`
-- Transforms: `training/transforms.py`
-- Losses: `training/losses.py`
-- Metrics: `training/metrics.py`
-- Utilities: `training/utils.py`
+Each run writes a stable `model_best_foldN.pth.tar`, a full resumable last
+checkpoint, `metrics.csv`, `run_summary.json`, the resolved config, and
+TensorBoard events. Monitor all runs with:
+
+```bash
+tensorboard --logdir experiments --bind_all --port 6006
+```
+
+The notebooks in `notebooks/train_organ.ipynb` and
+`notebooks/train_lesion.ipynb` are thin front ends to these same commands;
+the YAML files remain the single source of parameters.
+
+### Package drop-in models
+
+After organ training and all five lesion folds, build an inference-ready
+models directory with checksums. The existing classifier is copied unchanged:
+
+```bash
+python scripts/package_models.py \
+  --output deployment_models \
+  --organ experiments/organ/<run>/model.ts \
+  --lesion experiments/lesion/fold0/<run>/model_best_fold0.pth.tar \
+  --lesion experiments/lesion/fold1/<run>/model_best_fold1.pth.tar \
+  --lesion experiments/lesion/fold2/<run>/model_best_fold2.pth.tar \
+  --lesion experiments/lesion/fold3/<run>/model_best_fold3.pth.tar \
+  --lesion experiments/lesion/fold4/<run>/model_best_fold4.pth.tar
+```
+
+Replace the inference `models/` mount with this directory only after reviewing
+the held-out results and `deployment_manifest.json`. Classifier training is
+out of scope and its weights are not modified.
+
+### Final held-out evaluation
+
+Do not use the locked test results for epoch or hyperparameter selection. Once
+the organ model and all five lesion folds are frozen, evaluate them once:
+
+```bash
+python -m training.evaluate \
+  --task organ --config configs/organ.yaml \
+  --model experiments/organ/<run>/model.ts \
+  --output-dir evaluation/organ
+
+python -m training.evaluate \
+  --task lesion --config configs/lesion.yaml \
+  --model experiments/lesion/fold0/<run>/model_best_fold0.pth.tar \
+  --model experiments/lesion/fold1/<run>/model_best_fold1.pth.tar \
+  --model experiments/lesion/fold2/<run>/model_best_fold2.pth.tar \
+  --model experiments/lesion/fold3/<run>/model_best_fold3.pth.tar \
+  --model experiments/lesion/fold4/<run>/model_best_fold4.pth.tar \
+  --output-dir evaluation/lesion
+```
+
+This writes per-case metrics, an overall JSON summary, and performance
+breakdowns by scanner manufacturer, model, and study year. Lesion evaluation
+uses the deployed five-fold mean and 0.63 threshold.
 
 
 ## Evaluation
@@ -385,7 +468,7 @@ This calls `scripts/eval_dice.py` under the hood (loads two NIfTI files, compute
   - Post-inference probabilities are multiplied by the organ mask prior to thresholding.
   - If the organ mask is empty (no prostate detected), lesion inference is skipped entirely.
 - Fixed lesion threshold (0.63) after ensemble averaging.
-- Organ segmentation produces multi-class output (background/TZ/PZ) via argmax post-processing.
+- Organ segmentation produces a binary whole-gland output via argmax post-processing.
 - RTSTRUCT generation requires the `rt-utils` package and handles SGH de-identified data quirks (missing `StudyID` tag, slice count mismatches between NIfTI and DICOM).
 - GPU strongly recommended (PyTorch + 3D inference); CPU fallback supported.
 
@@ -395,7 +478,7 @@ This calls `scripts/eval_dice.py` under the hood (loads two NIfTI files, compute
 - Multi-parametric inputs (T2 + ADC + high b‑value), with curated series selection rules validated on ~43,500 annotated rows, increase robustness to site naming variability.
 - Automatic highest-b-value filtering handles multi-b DWI series without manual intervention.
 - Two-stage approach:
-  - Organ segmentation ensures prostate-focused processing and provides multi-class anatomical zones (TZ/PZ).
+  - Organ segmentation ensures prostate-focused processing with a cleaned binary whole-gland mask.
   - Lesion segmentation is both ROI‑focused and organ‑masked for fewer false positives.
 - 5‑fold ensemble improves lesion robustness and calibration; fold probabilities are exported for transparency.
 - PI‑RADS classification uses 3D crops and a size-based rule to better separate 4 vs. 5.
@@ -423,7 +506,7 @@ This calls `scripts/eval_dice.py` under the hood (loads two NIfTI files, compute
 
 - Confirm outputs exist:
   - `output/t2/t2.nii.gz`, `output/adc/adc.nii.gz`, `output/highb/highb.nii.gz`
-  - `output/organ/organ.nii.gz` (original, multi-class: 0=background, 1=TZ, 2=PZ)
+  - `output/organ/organ.nii.gz` (original binary whole-gland mask)
   - `output/organ/cleaned_organ.nii.gz` (cleaned: islands removed, holes filled)
   - `output/organ/cleanup_metrics.json` (cleanup audit)
   - `output/lesion/fold*_lesion_prob.nii.gz`, `output/lesion/merged_lesion_prob.nii.gz`, `output/lesion/lesion_mask.nii.gz`

@@ -1,5 +1,8 @@
 /data
 /experiments
+/artifacts
+/evaluation
+/deployment_models
 /models
 /models_backup
 /output 
@@ -15,6 +18,8 @@ output_beta/
 /output*
 /Interesting outputs
 /interesting_outputs_follow_up
+/[Oo][Uu][Tt][Pp][Uu][Tt][Ss]*[A-Za-z0-9_/-]*[Oo][Uu][Tt][Pp][Uu][Tt][Ss]*
+28_july_outputs_follow_up_for_anh
 
 # Windows / macOS metadata files (often appear after copying/unzipping datasets)
 .Identifier

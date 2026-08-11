@@ -1,0 +1,23 @@
+services:
+  prostate-mri-training:
+    image: prostate-mri-training:latest
+    shm_size: "16gb"
+    working_dir: /workspace
+    volumes:
+      - ${PROJECT_DIR:-..}:/workspace
+      - ${HIVE_OUTPUT_DIR:?Set HIVE_OUTPUT_DIR}:/hive-output:ro
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${GPU_ID:-0}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command:
+      - python
+      - -m
+      - training.train_organ
+      - --config
+      - configs/organ.yaml

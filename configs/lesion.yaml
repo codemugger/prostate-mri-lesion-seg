@@ -1,93 +1,28 @@
+# Five-fold T2+ADC+HIGHB lesion training. Select the fold on the CLI.
 dataset:
-  # For quick testing without predefined splits, set both CSVs to null and enable scan_all.
-  train_split_csv: null
-  val_split_csv: null
-  scan_all: true           # when true and CSVs are null/missing, scan directories and split internally
-  split_ratio: 0.8         # fraction for training; remainder used for validation
-  t2_dir: data/preprocessed/t2
-  adc_dir: data/preprocessed/adc
-  highb_dir: data/preprocessed/highb
-  organ_mask_dir: data/preprocessed/organ_masks
-  lesion_mask_dir: data/preprocessed/lesion_masks
-  cache_rate: 0.2
+  manifest: artifacts/training/training_manifest.csv
+  split_csv: artifacts/training/lesion_splits.csv
+  # Persistent, invalidation-aware preprocessing cache; safe to reuse across folds.
+  cache_dir: artifacts/training/lesion_cache
   num_workers: 4
+  source_sampling_weights: null
 
+# Mirrors custom_lesion_seg_operator.py, including its ROI convention.
 preprocess:
-  spacing: [0.5, 0.5, 0.5]   # 0.5mm isotropic spacing for lesion segmentation (matches inference)
-  roi_size: [96, 96, 16]   # patch size for training (matches inference sliding window)
-  roi_margin: 32             # margin around organ mask for ROI cropping (matches inference)
-  samples_per_image: 4     # number of random patches per image
-  pos_to_neg_ratio: 2.5    # balanced sampling around positives/negatives
+  spacing: [0.5, 0.5, 0.5]
+  roi_margin: 32
+  patch_size: [128, 128, 32]
+  samples_per_case: 4
+  positive_fraction: 0.67
 
 augment:
-  prob: 0.15
-  enable:
-    elastic: true
-    zoom: true
-    rotate90: true
-    bias_field: true
-    gaussian_smooth: true
-    gibbs_noise: true
-    gaussian_noise: true
-    shift_intensity: true
-    sharpen: false
-    adjust_contrast: false
-  elastic:
-    sigma_range: [0.5, 1.5]
-    magnitude_range: [0.5, 1.0]
-    rotate_range: [0.05, 0.05, 0.05]
-    translate_range: [2, 2, 0]
-    scale_range: [0.05, 0.05, 0.0]
-    prob: 0.15
-  zoom:
-    min_zoom: 0.9
-    max_zoom: 1.1
-    prob: 0.15
-  rotate90:
-    prob: 0.15
-    max_k: 3
-  bias_field:
-    coeff_range: [0.0, 0.01]
-    degree: 3
-    prob: 0.15
-  gaussian_smooth:
-    sigma_x: [0.25, 1.0]
-    sigma_y: [0.25, 1.0]
-    sigma_z: [0.25, 1.0]
-    prob: 0.15
-  gibbs_noise:
-    alpha: [0.5, 1.0]
-    prob: 0.15
-  gaussian_noise:
-    mean: 0.0
-    std: 0.05
-    prob: 0.15
-  shift_intensity:
-    offsets: 0.1
-    prob: 0.15
-  sharpen:
-    sigma1_x: [0.5, 1.0]
-    sigma1_y: [0.5, 1.0]
-    sigma1_z: [0.5, 1.0]
-    sigma2_x: [0.5, 1.0]
-    sigma2_y: [0.5, 1.0]
-    sigma2_z: [0.5, 1.0]
-    alpha: [10.0, 20.0]
-    prob: 0.1
-  adjust_contrast:
-    gamma: [0.7, 1.3]
-    prob: 0.1
+  enabled: true
 
+# Exact strict-load architecture used by the current five inference folds.
 model:
-  # type can be: "unet" (MONAI UNet) or "rrunet3d" (training/rrunet.py)
   type: rrunet3d
-  in_channels: 3              # T2, ADC, HIGHB (multi-parametric input)
-  out_channels: 2             # background=0, lesion=1 (binary lesion segmentation)
-  # UNet-only (ignored by rrunet3d):
-  channels: [16, 32, 64, 128, 256]
-  strides: [2, 2, 2, 2]
-  num_res_units: 2
-  # RRUNet3D-only:
+  in_channels: 3
+  out_channels: 2
   blocks_down: "1,2,3,4"
   blocks_up: "3,2,1"
   num_init_kernels: 32
@@ -104,19 +39,15 @@ train:
   amp: true
   seed: 42
   grad_accum_steps: 1
-  log_interval: 10
+  log_interval: 20
   val_interval: 1
-  deterministic: true
 
+# RRUNet already applies Softmax, so this loss consumes probabilities directly.
 loss:
-  type: dice_focal   # Dice + Focal for imbalance
-  dice:
-    include_background: false  # Focus on lesion class (class 1)
-    to_onehot_y: true
-    softmax: true
-  focal:
-    gamma: 2.0
-    alpha: 0.75
+  gamma: 2.0
+  alpha: 0.75
+  dice_weight: 1.0
+  focal_weight: 1.0
 
 optimizer:
   type: adamw
@@ -127,25 +58,11 @@ scheduler:
   eta_min: 1.0e-6
 
 validation:
-  inferer_roi_size: [128, 128, 16]
-  inferer_sw_batch_size: 4
-  inferer_overlap: 0.5
-  # For lesion segmentation, exclude background from dice calculation
-  # (focus on lesion detection quality)
-  include_background: false
+  # Fold selection uses a conventional single-model threshold. The app's
+  # five-fold ensemble continues to use its existing 0.63 threshold.
+  threshold: 0.5
+  ensemble_threshold: 0.63
 
 output:
   exp_dir: experiments/lesion
-  # Create a new subfolder per run: exp-001, exp-002, ...
-  per_run_subdir: true
-  # Enable TensorBoard logging
-  tensorboard: true
-  tb_subdir: tb
-  # Base names used for checkpoint files written inside the run subdir.
-  # The trainer will suffix these with epoch/exp/dice info.
-  best_checkpoint_name: best_model
-  last_checkpoint_name: last_model
-  metrics_csv: metrics.csv
-  # Save last checkpoint every N epochs (default: 1 = every epoch)
-  # Set to a higher value (e.g., 10) to save disk space, or set to epochs to only save at the end
-  save_last_interval: 10  # Save last checkpoint every 10 epochs (and always at final epoch)
+  save_last_interval: 1

@@ -9,13 +9,12 @@ output_beta/
 .git/
 .gitignore
 
-# ---- Training / experiment artefacts ----
+# ---- Training data / experiment artefacts ----
 notebooks/
-training/
-configs/
 data/
 data_backup/
 experiments/
+artifacts/
 PROSTATEx_masks/
 ORIGINAL prostate-mri-lesion-seg REFERENCE/
 

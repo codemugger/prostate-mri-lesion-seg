@@ -1,354 +1,318 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import os
-from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+from collections import Counter
+from pathlib import Path
+from typing import Mapping, Sequence
 
-from monai.data import Dataset, CacheDataset
-import nibabel as nib
 import numpy as np
-import SimpleITK as sitk
+import torch
+from monai.data import CacheDataset, Dataset
+from torch.utils.data import Dataset as TorchDataset
+from torch.utils.data import WeightedRandomSampler
+
+from .cohort import read_manifest
+from .transforms import preprocess_lesion_case
 
 
-@dataclass
-class OrganDatasetPaths:
-    t2_dir: str
-    label_dir: str
+LESION_CACHE_VERSION = "v2-float32-inference-matched"
 
 
-@dataclass
-class LesionDatasetPaths:
-    t2_dir: str
-    adc_dir: str
-    highb_dir: str
-    organ_mask_dir: str
-    lesion_mask_dir: str
+def _is_true(value: object) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
 
 
-def read_subject_ids(csv_path: str) -> List[str]:
-    """
-    Reads a CSV with a single column `subject_id` and returns the list of IDs.
-    """
-    subject_ids: List[str] = []
-    with open(csv_path, "r", newline="") as f:
-        reader = csv.DictReader(f)
-        if "subject_id" not in reader.fieldnames:
-            raise ValueError("CSV must contain a 'subject_id' column.")
-        for row in reader:
-            sid = row["subject_id"].strip()
-            if sid:
-                subject_ids.append(sid)
-    if not subject_ids:
-        raise ValueError(f"No subject_id found in {csv_path}")
-    return subject_ids
+def read_split_rows(path: str | Path) -> list[dict[str, str]]:
+    with Path(path).open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        required = {"source", "subject_id", "split"}
+        missing = sorted(required - set(reader.fieldnames or []))
+        if missing:
+            raise ValueError(f"Split CSV is missing column(s): {', '.join(missing)}")
+        rows = [dict(row) for row in reader]
+    identities = [(row["source"], row["subject_id"]) for row in rows]
+    if len(identities) != len(set(identities)):
+        raise ValueError("Split CSV contains duplicate source/subject_id pairs")
+    return rows
 
 
-def _extract_base_id_from_t2_filename(filename: str) -> str:
-    """
-    Extracts the base subject ID from a T2 filename that may contain suffixes.
-    Example:
-      - ProstateX-0004_t2_tse_tra_5.nii.gz -> ProstateX-0004
-      - ProstateX-0004.nii.gz -> ProstateX-0004
-    """
-    if not filename.endswith(".nii.gz"):
-        return ""
-    stem = filename[:-7]  # strip .nii.gz
-    # split on the first underscore if present
-    if "_" in stem:
-        return stem.split("_", 1)[0]
-    return stem
+def select_records(
+    manifest_path: str | Path,
+    split_path: str | Path,
+    *,
+    task: str,
+    partition: str,
+    fold: int | None = None,
+) -> list[dict[str, str]]:
+    """Join a manifest to a locked split without allowing case leakage."""
+    if task not in {"organ", "lesion"}:
+        raise ValueError("task must be organ or lesion")
+    if partition not in {"train", "val", "test"}:
+        raise ValueError("partition must be train, val, or test")
+    if task == "lesion" and partition != "test" and fold not in range(5):
+        raise ValueError("lesion train/val selection requires fold 0..4")
 
-
-def list_subject_ids_from_dirs(t2_dir: str, label_dir: str) -> List[str]:
-    """
-    Lists subject IDs by intersecting filename stems present in both t2_dir and label_dir.
-    T2 filenames may have suffixes; labels are assumed to be <SUBJECT_ID>.nii.gz
-    """
-    def t2_base_ids(dir_path: str) -> set:
-        result = set()
-        for name in os.listdir(dir_path):
-            if not name.endswith(".nii.gz"):
-                continue
-            base = _extract_base_id_from_t2_filename(name)
-            if base:
-                result.add(base)
-        return result
-
-    def label_stems(dir_path: str) -> set:
-        result = set()
-        for name in os.listdir(dir_path):
-            if not name.endswith(".nii.gz"):
-                continue
-            stem = name[:-7]
-            if stem:
-                result.add(stem)
-        return result
-
-    if not os.path.isdir(t2_dir):
-        raise FileNotFoundError(f"Not a directory: {t2_dir}")
-    if not os.path.isdir(label_dir):
-        raise FileNotFoundError(f"Not a directory: {label_dir}")
-
-    img_stems = t2_base_ids(t2_dir)
-    lbl_stems = label_stems(label_dir)
-    common = sorted(list(img_stems.intersection(lbl_stems)))
-    if not common:
-        raise ValueError(f"No common subject IDs found between {t2_dir} and {label_dir}")
-    return common
-
-
-def list_lesion_subject_ids_from_dirs(
-    t2_dir: str,
-    organ_mask_dir: str,
-    lesion_mask_dir: str,
-) -> List[str]:
-    """
-    Lists subject IDs that have T2 and organ mask.
-    Lesion mask is optional - missing masks represent cases with no tumor detected.
-    """
-    def t2_base_ids(dir_path: str) -> set:
-        result = set()
-        for name in os.listdir(dir_path):
-            if not name.endswith(".nii.gz"):
-                continue
-            base = _extract_base_id_from_t2_filename(name)
-            if base:
-                result.add(base)
-        return result
-
-    def mask_stems(dir_path: str) -> set:
-        result = set()
-        if not os.path.isdir(dir_path):
-            return result
-        for name in os.listdir(dir_path):
-            if not name.endswith(".nii.gz"):
-                continue
-            stem = name[:-7]  # Remove .nii.gz
-            if stem:
-                result.add(stem)
-        return result
-
-    if not os.path.isdir(t2_dir):
-        raise FileNotFoundError(f"Not a directory: {t2_dir}")
-    if not os.path.isdir(organ_mask_dir):
-        raise FileNotFoundError(f"Not a directory: {organ_mask_dir}")
-    # lesion_mask_dir is optional - may not exist or may be empty
-
-    t2_ids = t2_base_ids(t2_dir)
-    organ_ids = mask_stems(organ_mask_dir)
-    
-    # Require T2 and organ mask (lesion mask is optional)
-    common = sorted(list(t2_ids.intersection(organ_ids)))
-    if not common:
-        raise ValueError(
-            f"No common subject IDs found across T2 ({t2_dir}) and organ masks ({organ_mask_dir})"
-        )
-    return common
-
-
-def _resolve_t2_path_for_subject(t2_dir: str, subject_id: str) -> str:
-    """
-    Resolves the actual T2 file path for a subject, supporting suffixed filenames.
-    Preference:
-      1) Exact match <SUBJECT_ID>.nii.gz
-      2) File starting with <SUBJECT_ID>_t2 (case-insensitive)
-      3) Any file starting with <SUBJECT_ID>_
-      4) Otherwise raise FileNotFoundError
-    """
-    # Normalize subject_id: remove .nii extension if present (CSV files may have it)
-    base_id = subject_id.replace(".nii", "").replace(".gz", "")
-    
-    exact = os.path.join(t2_dir, f"{base_id}.nii.gz")
-    if os.path.exists(exact):
-        return exact
-    candidates = []
-    t2_pref = []
-    prefix = f"{base_id}_"
-    for name in os.listdir(t2_dir):
-        if not name.endswith(".nii.gz"):
+    manifest = {
+        (row["source"], row["subject_id"]): row
+        for row in read_manifest(Path(manifest_path))
+        if _is_true(row[f"{task}_eligible"])
+    }
+    selected: list[dict[str, str]] = []
+    for assignment in read_split_rows(split_path):
+        identity = (assignment["source"], assignment["subject_id"])
+        record = manifest.get(identity)
+        if record is None:
             continue
-        if name.startswith(prefix):
-            candidates.append(name)
-            lower = name.lower()
-            if "_t2" in lower:
-                t2_pref.append(name)
-    chosen = None
-    if t2_pref:
-        chosen = sorted(t2_pref)[0]
-    elif candidates:
-        chosen = sorted(candidates)[0]
-    if chosen is None:
-        raise FileNotFoundError(f"No T2 file found for subject {subject_id} in {t2_dir}")
-    return os.path.join(t2_dir, chosen)
+        if task == "organ":
+            include = assignment["split"] == partition
+        elif partition == "test":
+            include = assignment["split"] == "test"
+        elif partition == "val":
+            include = (
+                assignment["split"] == "development"
+                and assignment.get("fold", "") == str(fold)
+            )
+        else:
+            include = (
+                assignment["split"] == "development"
+                and assignment.get("fold", "") != str(fold)
+            )
+        if include:
+            selected.append(dict(record))
+    selected.sort(key=lambda row: (row["source"], row["subject_id"]))
+    if not selected:
+        raise ValueError(f"No {task} records selected for partition={partition}")
+    return selected
 
 
-def build_organ_items(subject_ids: List[str], paths: OrganDatasetPaths) -> List[Dict[str, str]]:
-    """
-    Builds a list of dicts with MONAI dictionary keys for T2 image and organ mask label.
-    """
-    items: List[Dict[str, str]] = []
-    for sid in subject_ids:
-        # Normalize subject_id: remove .nii extension if present (CSV files may have it)
-        base_id = sid.replace(".nii", "").replace(".gz", "")
-        
-        img_path = _resolve_t2_path_for_subject(paths.t2_dir, sid)
-        label_path = os.path.join(paths.label_dir, f"{base_id}.nii.gz")
-        if not os.path.exists(label_path):
-            raise FileNotFoundError(f"Missing label: {label_path}")
-        items.append({"image": img_path, "label": label_path, "subject_id": base_id})
-    return items
-
-
-def create_monai_datasets(
-    train_items: List[Dict[str, str]],
-    val_items: List[Dict[str, str]],
-    train_transforms,
-    val_transforms,
+def build_organ_datasets(
+    train_records: Sequence[Mapping[str, str]],
+    val_records: Sequence[Mapping[str, str]],
+    *,
+    train_transform,
+    val_transform,
     cache_rate: float,
     num_workers: int,
-) -> Tuple[Dataset, Dataset]:
-    """
-    Creates MONAI CacheDataset for train/val for faster IO and transform caching.
-    """
-    train_ds = CacheDataset(train_items, transform=train_transforms, cache_rate=cache_rate, num_workers=num_workers)
-    val_ds = CacheDataset(val_items, transform=val_transforms, cache_rate=0.0, num_workers=num_workers)
-    return train_ds, val_ds
+) -> tuple[CacheDataset, Dataset]:
+    def items(records: Sequence[Mapping[str, str]]) -> list[dict[str, str]]:
+        return [
+            {
+                "image": row["t2_path"],
+                "label": row["organ_label_path"],
+                "subject_id": row["subject_id"],
+                "source": row["source"],
+            }
+            for row in records
+        ]
+
+    train = CacheDataset(
+        items(train_records),
+        transform=train_transform,
+        cache_rate=float(cache_rate),
+        num_workers=int(num_workers),
+    )
+    validation = Dataset(items(val_records), transform=val_transform)
+    return train, validation
 
 
-def _resolve_modality_path(modality_dir: str, subject_id: str, modality: str) -> Optional[str]:
-    """
-    Resolves the path for a modality (ADC or HIGHB) for a subject.
-    Returns None if not found (modalities are optional).
-    """
-    base_id = subject_id.replace(".nii", "").replace(".gz", "")
-    
-    # Try common naming patterns
-    patterns = [
-        f"{base_id}_{modality}.nii.gz",
-        f"{base_id}_{modality.upper()}.nii.gz",
-        f"{modality}_{base_id}.nii.gz",
-        f"{modality.upper()}_{base_id}.nii.gz",
-        f"{base_id}.nii.gz",  # Fallback: exact match
-    ]
-    
-    for pattern in patterns:
-        path = os.path.join(modality_dir, pattern)
-        if os.path.exists(path):
-            return path
-    
-    return None
+def source_balanced_sampler(
+    records: Sequence[Mapping[str, str]],
+    repeats: int = 1,
+    source_weights: Mapping[str, float] | None = None,
+):
+    """Create an explicit source-mixture sampler.
 
-
-def _resample_to_match_t2(adc_path: Optional[str], highb_path: Optional[str], t2_path: str, output_dir: str) -> Tuple[Optional[str], Optional[str]]:
+    If weights are omitted each source receives equal mass. Callers should use
+    ordinary shuffled sampling when they want the natural cohort proportions.
     """
-    Resamples ADC and HIGHB to match T2 geometry using SimpleITK.
-    Returns paths to resampled files (or None if input was None or empty string).
-    """
-    t2_sitk = sitk.ReadImage(t2_path)
-    t2_size = t2_sitk.GetSize()
-    t2_spacing = t2_sitk.GetSpacing()
-    t2_origin = t2_sitk.GetOrigin()
-    t2_direction = t2_sitk.GetDirection()
-    t2_pixel_id = t2_sitk.GetPixelID()
-    
-    os.makedirs(output_dir, exist_ok=True)
-    
-    adc_resampled = None
-    if adc_path and adc_path.strip() and os.path.exists(adc_path):
-        try:
-            adc_sitk = sitk.ReadImage(adc_path)
-            adc_resampled_sitk = sitk.Resample(
-                adc_sitk, t2_size,
-                sitk.Transform(),
-                sitk.sitkLinear,  # Use linear interpolation for ADC
-                t2_origin,
-                t2_spacing,
-                t2_direction,
-                0,
-                t2_pixel_id
-            )
-            adc_output_path = os.path.join(output_dir, os.path.basename(adc_path))
-            sitk.WriteImage(adc_resampled_sitk, adc_output_path)
-            adc_resampled = adc_output_path
-        except Exception as e:
-            print(f"Warning: Failed to resample ADC {adc_path}: {e}")
-            adc_resampled = None
-    
-    highb_resampled = None
-    if highb_path and highb_path.strip() and os.path.exists(highb_path):
-        try:
-            highb_sitk = sitk.ReadImage(highb_path)
-            highb_resampled_sitk = sitk.Resample(
-                highb_sitk, t2_size,
-                sitk.Transform(),
-                sitk.sitkLinear,  # Use linear interpolation for HIGHB
-                t2_origin,
-                t2_spacing,
-                t2_direction,
-                0,
-                t2_pixel_id
-            )
-            highb_output_path = os.path.join(output_dir, os.path.basename(highb_path))
-            sitk.WriteImage(highb_resampled_sitk, highb_output_path)
-            highb_resampled = highb_output_path
-        except Exception as e:
-            print(f"Warning: Failed to resample HIGHB {highb_path}: {e}")
-            highb_resampled = None
-    
-    return adc_resampled, highb_resampled
-
-
-def build_lesion_items(subject_ids: List[str], paths: LesionDatasetPaths, temp_resample_dir: str = "/tmp/lesion_resampled") -> List[Dict[str, str]]:
-    """
-    Builds a list of dicts with MONAI dictionary keys for multi-parametric lesion segmentation.
-    Keys: "image" (stacked T2+ADC+HIGHB), "organ_mask", "label" (lesion mask), "subject_id"
-    
-    Note: ADC and HIGHB are optional. If missing, they will be set to zeros matching T2 geometry.
-    """
-    items: List[Dict[str, str]] = []
-    
-    for sid in subject_ids:
-        base_id = sid.replace(".nii", "").replace(".gz", "")
-        
-        # Resolve T2 path (required)
-        t2_path = _resolve_t2_path_for_subject(paths.t2_dir, sid)
-        if not os.path.exists(t2_path):
-            raise FileNotFoundError(f"T2 file not found for subject {sid}: {t2_path}")
-        
-        # Resolve ADC and HIGHB paths (optional)
-        adc_path = _resolve_modality_path(paths.adc_dir, sid, "adc")
-        highb_path = _resolve_modality_path(paths.highb_dir, sid, "highb")
-        
-        # Resample ADC and HIGHB to match T2 geometry
-        adc_resampled, highb_resampled = _resample_to_match_t2(
-            adc_path, highb_path, t2_path, temp_resample_dir
+    sources = [row["source"] for row in records for _ in range(int(repeats))]
+    counts = Counter(sources)
+    target = (
+        {source: 1.0 for source in counts}
+        if source_weights is None
+        else {str(key): float(value) for key, value in source_weights.items()}
+    )
+    missing = sorted(set(counts) - set(target))
+    if missing:
+        raise ValueError(
+            "dataset.source_sampling_weights is missing source(s): "
+            + ", ".join(missing)
         )
-        
-        # Resolve organ mask path (required for ROI cropping)
-        organ_mask_path = os.path.join(paths.organ_mask_dir, f"{base_id}.nii.gz")
-        if not os.path.exists(organ_mask_path):
-            raise FileNotFoundError(f"Organ mask not found for subject {sid}: {organ_mask_path}")
-        
-        # Resolve lesion mask path (optional - missing means no tumor detected)
-        lesion_mask_path = os.path.join(paths.lesion_mask_dir, f"{base_id}.nii.gz")
-        if not os.path.exists(lesion_mask_path):
-            # If lesion mask doesn't exist, we'll create an empty mask (all zeros) during loading
-            # This represents cases where no tumor was detected
-            lesion_mask_path = None
-        
-        item = {
-            "t2": t2_path,
-            "organ_mask": organ_mask_path,
-            "label": lesion_mask_path,
-            "subject_id": base_id,
+    if any(target[source] <= 0 for source in counts):
+        raise ValueError("All source sampling weights must be positive")
+    weights = torch.as_tensor(
+        [target[source] / counts[source] for source in sources], dtype=torch.double
+    )
+    return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
+
+def _cache_key(record: Mapping[str, str], spacing: Sequence[float], margin: int) -> str:
+    values = [LESION_CACHE_VERSION, str(tuple(spacing)), str(margin)]
+    for key in (
+        "t2_path",
+        "adc_path",
+        "highb_path",
+        "organ_label_path",
+        "lesion_label_path",
+    ):
+        path = Path(record[key])
+        stat = path.stat()
+        values.extend([str(path.resolve()), str(stat.st_size), str(stat.st_mtime_ns)])
+    return hashlib.sha256("|".join(values).encode("utf-8")).hexdigest()
+
+
+class LesionDataset(TorchDataset):
+    """On-demand inference-matched lesion preprocessing with a persistent cache."""
+
+    def __init__(
+        self,
+        records: Sequence[Mapping[str, str]],
+        *,
+        cache_dir: str | Path,
+        spacing: Sequence[float],
+        margin: int,
+        patch_size: Sequence[int] | None,
+        samples_per_case: int = 1,
+        positive_fraction: float = 0.67,
+        augment: bool = False,
+    ):
+        self.records = [dict(record) for record in records]
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.spacing = tuple(float(value) for value in spacing)
+        self.margin = int(margin)
+        self.patch_size = (
+            tuple(int(value) for value in patch_size) if patch_size is not None else None
+        )
+        self.samples_per_case = int(samples_per_case)
+        self.positive_fraction = float(positive_fraction)
+        self.augment = bool(augment)
+        if self.samples_per_case < 1:
+            raise ValueError("samples_per_case must be >= 1")
+        if not 0.0 <= self.positive_fraction <= 1.0:
+            raise ValueError("positive_fraction must be between 0 and 1")
+
+    def __len__(self) -> int:
+        return len(self.records) * self.samples_per_case
+
+    def _load(self, record: Mapping[str, str]) -> dict[str, np.ndarray]:
+        cache_path = self.cache_dir / (
+            _cache_key(record, self.spacing, self.margin) + ".npz"
+        )
+        if not cache_path.is_file():
+            prepared = preprocess_lesion_case(
+                record, spacing=self.spacing, margin=self.margin
+            )
+            temporary = cache_path.with_name(
+                f".{cache_path.stem}.{os.getpid()}.tmp.npz"
+            )
+            np.savez_compressed(
+                temporary,
+                image=prepared["image"].astype(np.float32),
+                label=prepared["label"].astype(np.uint8),
+                organ=prepared["organ"].astype(np.uint8),
+            )
+            try:
+                os.replace(temporary, cache_path)
+            except FileNotFoundError:
+                pass
+        try:
+            with np.load(cache_path, allow_pickle=False) as data:
+                return {
+                    "image": data["image"].astype(np.float32),
+                    "label": data["label"].astype(np.uint8),
+                    "organ": data["organ"].astype(np.uint8),
+                }
+        except (OSError, ValueError):
+            cache_path.unlink(missing_ok=True)
+            return self._load(record)
+
+    @staticmethod
+    def _pad(
+        image: np.ndarray, label: np.ndarray, minimum: Sequence[int]
+    ) -> tuple[np.ndarray, np.ndarray]:
+        padding = []
+        for size, target in zip(image.shape[1:], minimum):
+            total = max(0, int(target) - int(size))
+            padding.append((total // 2, total - total // 2))
+        if any(before or after for before, after in padding):
+            image = np.pad(image, [(0, 0), *padding], mode="constant")
+            label = np.pad(label, padding, mode="constant")
+        return image, label
+
+    def _crop_patch(
+        self, image: np.ndarray, label: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        assert self.patch_size is not None
+        image, label = self._pad(image, label, self.patch_size)
+        spatial = np.asarray(image.shape[1:])
+        patch = np.asarray(self.patch_size)
+        positives = np.argwhere(label > 0)
+        use_positive = positives.size and np.random.random() < self.positive_fraction
+        if use_positive:
+            center = positives[np.random.randint(len(positives))]
+        else:
+            center = np.asarray(
+                [np.random.randint(int(size)) for size in spatial], dtype=np.int64
+            )
+        start = np.minimum(np.maximum(center - patch // 2, 0), spatial - patch)
+        slices = tuple(
+            slice(int(start[i]), int(start[i] + patch[i])) for i in range(3)
+        )
+        return image[(slice(None),) + slices], label[slices]
+
+    @staticmethod
+    def _pad_for_network(
+        image: np.ndarray, label: np.ndarray, multiple: int = 32
+    ) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int]]:
+        original = tuple(int(value) for value in label.shape)
+        target = tuple(max(multiple, size) for size in original)
+        image, label = LesionDataset._pad(image, label, target)
+        return image, label, original
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        record = self.records[index // self.samples_per_case]
+        prepared = self._load(record)
+        image, label, organ = (
+            prepared["image"],
+            prepared["label"],
+            prepared["organ"],
+        )
+        original_shape = tuple(int(value) for value in label.shape)
+        if self.patch_size is not None:
+            image, label = self._crop_patch(image, label)
+        else:
+            image, label, original_shape = self._pad_for_network(image, label)
+            target_shape = label.shape
+            padding = []
+            for size, target in zip(organ.shape, target_shape):
+                total = max(0, int(target) - int(size))
+                padding.append((total // 2, total - total // 2))
+            organ = np.pad(organ, padding, mode="constant")
+
+        if self.augment:
+            for axis in range(3):
+                if np.random.random() < 0.5:
+                    image = np.flip(image, axis=axis + 1)
+                    label = np.flip(label, axis=axis)
+            if np.random.random() < 0.15:
+                image = image + np.random.normal(0.0, 0.05, image.shape).astype(
+                    np.float32
+                )
+
+        result: dict[str, object] = {
+            "image": torch.from_numpy(np.ascontiguousarray(image)).float(),
+            "label": torch.from_numpy(
+                np.ascontiguousarray(label[np.newaxis])
+            ).long(),
+            "subject_id": record["subject_id"],
+            "source": record["source"],
+            "original_shape": torch.as_tensor(original_shape, dtype=torch.int64),
         }
-        # Only add ADC/HIGHB if they exist (optional modalities)
-        if adc_resampled:
-            item["adc"] = adc_resampled
-        if highb_resampled:
-            item["highb"] = highb_resampled
-        
-        items.append(item)
-    
-    return items
+        if self.patch_size is None:
+            result["organ"] = torch.from_numpy(
+                np.ascontiguousarray(organ[np.newaxis])
+            ).to(torch.uint8)
+        return result

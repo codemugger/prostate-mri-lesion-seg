@@ -1,0 +1,30 @@
+# Separate training image. The working inference image/Dockerfile is unchanged.
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    PYTHONPATH=/opt/prostate-training
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    libgomp1 \
+    libglib2.0-0 \
+    && ln -sf /usr/bin/python3 /usr/bin/python \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --no-cache-dir --upgrade pip
+RUN python -m pip install --no-cache-dir \
+    torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+
+COPY docker/requirements-training.txt /tmp/requirements-training.txt
+RUN python -m pip install --no-cache-dir -r /tmp/requirements-training.txt
+
+WORKDIR /opt/prostate-training
+COPY training/ training/
+COPY configs/ configs/
+COPY scripts/ scripts/
+
+CMD ["python", "-m", "training.train_organ", "--help"]
