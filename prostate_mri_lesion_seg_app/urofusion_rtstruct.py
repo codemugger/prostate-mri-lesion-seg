@@ -220,8 +220,14 @@ class SourceSeries:
     @property
     def slice_spacing(self) -> float:
         if len(self.slices) > 1:
-            differences = np.diff([item.position for item in self.slices])
-            return float(np.median(differences))
+            # MONAI's DICOM volume affine spans the first and last selected
+            # slice, even when an intentionally sparse test series has gaps.
+            # Keep array index k mapped to source DICOM slice k; rt-utils then
+            # writes each contour on that slice's actual ImagePositionPatient.
+            return float(
+                (self.slices[-1].position - self.slices[0].position)
+                / (len(self.slices) - 1)
+            )
         return float(
             getattr(
                 self.first,
@@ -368,6 +374,7 @@ def _read_source_series(
     pixel_spacing = np.asarray(first.PixelSpacing, dtype=float)
     seen_sops: set[str] = set()
     positioned: list[DicomSlice] = []
+    first_position_vector = np.asarray(first.ImagePositionPatient, dtype=float)
     for path, header in image_headers:
         if str(header.StudyInstanceUID) != study_uid:
             raise GeometryMismatchError("T2 directory contains multiple studies")
@@ -395,26 +402,23 @@ def _read_source_series(
         if sop_uid in seen_sops:
             raise GeometryMismatchError(f"Duplicate T2 SOP Instance UID: {sop_uid}")
         seen_sops.add(sop_uid)
-        position = float(
-            np.dot(np.asarray(header.ImagePositionPatient, dtype=float), normal)
+        position_vector = np.asarray(header.ImagePositionPatient, dtype=float)
+        displacement = position_vector - first_position_vector
+        in_plane_displacement = displacement - normal * np.dot(
+            displacement,
+            normal,
         )
+        if np.linalg.norm(in_plane_displacement) > grid_tolerance_mm:
+            raise GeometryMismatchError(
+                "T2 image positions do not share one parallel slice grid"
+            )
+        position = float(np.dot(position_vector, normal))
         positioned.append(DicomSlice(path=path, header=header, position=position))
 
     positioned.sort(key=lambda item: item.position)
     positions = np.asarray([item.position for item in positioned], dtype=float)
     if len(positions) > 1 and np.any(np.diff(positions) <= grid_tolerance_mm):
         raise GeometryMismatchError("T2 series contains duplicate slice positions")
-    if len(positions) > 2:
-        differences = np.diff(positions)
-        median = float(np.median(differences))
-        if median <= 0.0 or not np.allclose(
-            differences,
-            median,
-            rtol=1e-3,
-            atol=grid_tolerance_mm,
-        ):
-            raise GeometryMismatchError("T2 slice spacing is nonuniform")
-
     return SourceSeries(slices=positioned, ignored_files=ignored)
 
 
@@ -423,15 +427,26 @@ def _validate_nifti_grid(
     series: SourceSeries,
     *,
     affine_tolerance_mm: float,
+    allow_unpositioned_empty_single_slice: bool = False,
 ) -> None:
     expected_shape = (series.columns, series.rows, len(series.slices))
-    if tuple(image.shape) != expected_shape:
+    actual_shape = tuple(image.shape)
+    normalized_shape = actual_shape + (1,) if len(actual_shape) == 2 else actual_shape
+    if normalized_shape != expected_shape:
         raise GeometryMismatchError(
-            f"NIfTI shape {tuple(image.shape)} does not match T2 grid {expected_shape}"
+            f"NIfTI shape {actual_shape} does not match T2 grid {expected_shape}"
         )
     affine = np.asarray(image.affine, dtype=float)
     if affine.shape != (4, 4) or not np.all(np.isfinite(affine)):
         raise GeometryMismatchError("NIfTI affine is invalid")
+    if allow_unpositioned_empty_single_slice:
+        if len(series.slices) != 1 or normalized_shape[2] != 1:
+            raise GeometryMismatchError(
+                "Unpositioned NIfTI allowance is limited to an empty "
+                "single-slice mask "
+                "and exactly one source T2 image"
+            )
+        return
     if not np.allclose(
         affine,
         series.expected_ras_affine,
@@ -451,7 +466,13 @@ def _validate_matching_nifti_grids(
     *,
     affine_tolerance_mm: float,
 ) -> None:
-    if tuple(first.shape) != tuple(second.shape):
+    first_shape = tuple(first.shape)
+    second_shape = tuple(second.shape)
+    first_normalized = first_shape + (1,) if len(first_shape) == 2 else first_shape
+    second_normalized = (
+        second_shape + (1,) if len(second_shape) == 2 else second_shape
+    )
+    if first_normalized != second_normalized:
         raise GeometryMismatchError(
             f"Organ and lesion shapes differ: {first.shape} vs {second.shape}"
         )
@@ -466,6 +487,8 @@ def _validate_matching_nifti_grids(
 
 def _binary_mask(image: nib.spatialimages.SpatialImage) -> np.ndarray:
     data = np.asanyarray(image.dataobj)
+    if data.ndim == 2:
+        data = data[:, :, np.newaxis]
     if data.ndim != 3:
         raise GeometryMismatchError(f"Expected a 3D NIfTI mask, got {data.shape}")
     if not np.all(np.isfinite(data)):
@@ -1032,15 +1055,38 @@ def _finalize_rtstruct(
     repaired_count = 0
     contour_count = 0
     source_sops = set(series.sop_instance_uids)
+    source_planes = {
+        str(item.header.SOPInstanceUID): float(item.position)
+        for item in series.slices
+    }
     for roi_contour in getattr(dataset, "ROIContourSequence", []):
         roi_number = int(roi_contour.ReferencedROINumber)
         is_prostate = roi_metadata[roi_number]["name"] == "Prostate"
         finalized: list[Dataset] = []
         for contour in getattr(roi_contour, "ContourSequence", []):
+            references = getattr(contour, "ContourImageSequence", [])
+            if len(references) != 1:
+                raise ReviewExportError(
+                    "Every contour must reference exactly one T2 slice"
+                )
+            referenced_sop = str(references[0].ReferencedSOPInstanceUID)
+            if referenced_sop not in source_planes:
+                raise ReviewExportError("Contour references a non-source T2 object")
             original_points = np.asarray(
                 contour.ContourData,
                 dtype=float,
             ).reshape(-1, 3)
+            # rt-utils assumes uniform slice spacing when converting mask
+            # indices into patient coordinates. Sparse/non-contiguous source
+            # stacks therefore need a normal-axis translation onto the exact
+            # ImagePositionPatient plane of the already referenced SOP.
+            source_plane = source_planes[referenced_sop]
+            contour_plane = float(np.mean(original_points @ series.normal))
+            original_points = original_points + (
+                (source_plane - contour_plane) * series.normal
+            )
+            contour_on_source_plane = copy.deepcopy(contour)
+            contour_on_source_plane.ContourData = original_points.reshape(-1).tolist()
             if len(original_points) > 1 and np.allclose(
                 original_points[0],
                 original_points[-1],
@@ -1054,7 +1100,7 @@ def _finalize_rtstruct(
             ):
                 repaired_count += 1
             repaired = _repair_contour(
-                contour,
+                contour_on_source_plane,
                 pixel_axis_column,
                 pixel_axis_row,
                 require_single_polygon=is_prostate,
@@ -1318,6 +1364,10 @@ def _validate_rtstruct(
     minimum_points: int | None = None
     contour_numbers: set[int] = set()
     prostate_contours_by_sop: dict[str, int] = {}
+    source_planes = {
+        str(item.header.SOPInstanceUID): float(item.position)
+        for item in series.slices
+    }
     for roi_contour in getattr(dataset, "ROIContourSequence", []):
         roi_number = int(roi_contour.ReferencedROINumber)
         contour_numbers.add(roi_number)
@@ -1345,25 +1395,33 @@ def _validate_rtstruct(
                 not in set(series.sop_instance_uids)
             ):
                 errors.append("invalid_contour_image_reference")
-            elif names_by_number.get(roi_number) == "Prostate":
+            else:
                 sop_uid = str(refs[0].ReferencedSOPInstanceUID)
-                prostate_contours_by_sop[sop_uid] = (
-                    prostate_contours_by_sop.get(sop_uid, 0) + 1
-                )
+                if np.max(
+                    np.abs((points @ series.normal) - source_planes[sop_uid])
+                ) > 1e-3:
+                    errors.append("contour_not_on_referenced_image_plane")
+                if names_by_number.get(roi_number) == "Prostate":
+                    prostate_contours_by_sop[sop_uid] = (
+                        prostate_contours_by_sop.get(sop_uid, 0) + 1
+                    )
     if contour_numbers != set(names_by_number):
         errors.append("roi_contour_number_set_mismatch")
-    expected_prostate_sops = {
-        series.slices[int(index)].header.SOPInstanceUID
-        for index in np.flatnonzero(
-            np.any(expected_rois["Prostate"], axis=(0, 1))
-        )
-    }
-    if set(prostate_contours_by_sop) != {
-        str(value) for value in expected_prostate_sops
-    }:
-        errors.append("prostate_contour_slice_set_mismatch")
-    if any(count != 1 for count in prostate_contours_by_sop.values()):
-        errors.append("prostate_has_multiple_contours_on_a_slice")
+    if "Prostate" in expected_rois:
+        expected_prostate_sops = {
+            series.slices[int(index)].header.SOPInstanceUID
+            for index in np.flatnonzero(
+                np.any(expected_rois["Prostate"], axis=(0, 1))
+            )
+        }
+        if set(prostate_contours_by_sop) != {
+            str(value) for value in expected_prostate_sops
+        }:
+            errors.append("prostate_contour_slice_set_mismatch")
+        if any(count != 1 for count in prostate_contours_by_sop.values()):
+            errors.append("prostate_has_multiple_contours_on_a_slice")
+    elif prostate_contours_by_sop:
+        errors.append("unexpected_prostate_contours_for_empty_segmentation")
 
     round_trip_differences: dict[str, int] = {}
     try:
@@ -1398,23 +1456,25 @@ def _create_rtstruct(
     output_path: Path,
     prepared_series_directory: Path,
     series: SourceSeries,
-    prostate_mask: np.ndarray,
+    prostate_mask: np.ndarray | None,
     lesions: Sequence[LesionROI],
 ) -> dict[str, Any]:
     rtstruct = RTStructBuilder.create_new(
         dicom_series_path=str(prepared_series_directory)
     )
-    prostate_rtutils = np.transpose(prostate_mask.astype(bool), (1, 0, 2))
-    rtstruct.add_roi(
-        mask=prostate_rtutils,
-        color=[0, 255, 0],
-        name="Prostate",
-        description="Patient-specific model prostate segmentation",
-        use_pin_hole=False,
-        approximate_contours=False,
-        roi_generation_algorithm="AUTOMATIC",
-    )
-    expected_rois: dict[str, np.ndarray] = {"Prostate": prostate_mask.astype(bool)}
+    expected_rois: dict[str, np.ndarray] = {}
+    if prostate_mask is not None:
+        prostate_rtutils = np.transpose(prostate_mask.astype(bool), (1, 0, 2))
+        rtstruct.add_roi(
+            mask=prostate_rtutils,
+            color=[0, 255, 0],
+            name="Prostate",
+            description="Patient-specific model prostate segmentation",
+            use_pin_hole=False,
+            approximate_contours=False,
+            roi_generation_algorithm="AUTOMATIC",
+        )
+        expected_rois["Prostate"] = prostate_mask.astype(bool)
     for index, lesion in enumerate(lesions):
         color = list(LESION_COLORS[index % len(LESION_COLORS)])
         rtstruct.add_roi(
@@ -1515,8 +1575,10 @@ def generate_accepted_rtstruct(
     unchanged native 26-connected components from ``lesion/lesion_mask.nii.gz``
     and are matched to ``lesions.txt`` scores only by reciprocal physical
     overlap. ROI numbering is deterministic: prostate is 1 and lesions are
-    2..N. Generation and validation occur in temporary storage; publication is
-    one atomic replacement after every structural and round-trip check passes.
+    2..N. A genuinely empty organ/lesion result is represented by a referenced
+    Structure Set with zero ROIs and zero contours; anatomy is never invented.
+    Generation and validation occur in temporary storage; publication is one
+    atomic replacement after every structural and round-trip check passes.
 
     No prostate smoothing is performed or published by this function.
     """
@@ -1539,41 +1601,76 @@ def generate_accepted_rtstruct(
         case_directory / "dicom/t2",
         grid_tolerance_mm=config.grid_tolerance_mm,
     )
+    organ_mask = _binary_mask(organ_image)
+    lesion_mask = _binary_mask(lesion_image)
+    empty_segmentation = not organ_mask.any()
+    if empty_segmentation and lesion_mask.any():
+        raise GeometryMismatchError(
+            "Lesion mask is nonempty while the cleaned prostate mask is empty"
+        )
+    allow_unpositioned_empty_single_slice = (
+        empty_segmentation
+        and not lesion_mask.any()
+        and len(series.slices) == 1
+        and organ_mask.shape[2] == 1
+        and lesion_mask.shape[2] == 1
+    )
     _validate_nifti_grid(
         organ_image,
         series,
         affine_tolerance_mm=config.affine_tolerance_mm,
+        allow_unpositioned_empty_single_slice=(
+            allow_unpositioned_empty_single_slice
+        ),
     )
     _validate_nifti_grid(
         lesion_image,
         series,
         affine_tolerance_mm=config.affine_tolerance_mm,
+        allow_unpositioned_empty_single_slice=(
+            allow_unpositioned_empty_single_slice
+        ),
     )
     _validate_matching_nifti_grids(
         organ_image,
         lesion_image,
         affine_tolerance_mm=config.affine_tolerance_mm,
     )
-
-    organ_mask = _binary_mask(organ_image)
-    lesion_mask = _binary_mask(lesion_image)
     scores = _parse_lesion_scores(case_directory / "lesions.txt")
     lesion_rois, lesion_mapping = build_lesion_rois(
         lesion_mask,
         organ_image.affine,
         scores,
     )
-    prostate_profile = build_single_outer_prostate_profile(
-        organ_mask,
-        lesion_mask,
-        organ_image.affine,
-        config,
-    )
-    if not prostate_profile.accepted:
-        raise ReviewExportError(
-            "Accepted single-outer prostate profile failed: "
-            + "; ".join(prostate_profile.failed_gates)
+    if empty_segmentation:
+        prostate_profile = SingleContourProfileResult(
+            mask=organ_mask,
+            accepted=True,
+            metrics={
+                "method": "empty_segmentation_no_rois",
+                "purpose": "Truthful empty output; no anatomy fabricated",
+                "source_voxels": 0,
+                "profile_voxels": 0,
+                "changed_voxels": 0,
+                "accepted": True,
+                "failed_gates": [],
+            },
+            failed_gates=[],
         )
+        prostate_mask_for_export: np.ndarray | None = None
+    else:
+        prostate_profile = build_single_outer_prostate_profile(
+            organ_mask,
+            lesion_mask,
+            organ_image.affine,
+            config,
+        )
+        if not prostate_profile.accepted:
+            raise ReviewExportError(
+                "Accepted single-outer prostate profile failed: "
+                + "; ".join(prostate_profile.failed_gates)
+            )
+        prostate_mask_for_export = prostate_profile.mask
 
     with tempfile.TemporaryDirectory(
         prefix=".accepted_rtstruct_",
@@ -1586,12 +1683,14 @@ def generate_accepted_rtstruct(
             staged_output,
             prepared_series,
             series,
-            prostate_profile.mask,
+            prostate_mask_for_export,
             lesion_rois,
         )
 
         dataset = pydicom.dcmread(staged_output, stop_before_pixels=True)
-        expected_numbers = list(range(1, len(lesion_rois) + 2))
+        expected_numbers = (
+            [] if empty_segmentation else list(range(1, len(lesion_rois) + 2))
+        )
         sequence_numbers = {
             "structure_set": [
                 int(item.ROINumber) for item in dataset.StructureSetROISequence
@@ -1618,6 +1717,16 @@ def generate_accepted_rtstruct(
                 "prostate_profile": prostate_profile.metrics,
                 "lesion_mapping": lesion_mapping,
                 "roi_numbers": sequence_numbers,
+                "empty_segmentation": empty_segmentation,
+                "source_slice_positions_mm": [
+                    float(item.position) for item in series.slices
+                ],
+                "source_slice_spacings_mm": [
+                    float(value)
+                    for value in np.diff(
+                        [item.position for item in series.slices]
+                    )
+                ],
             }
         )
         if not validate_only:

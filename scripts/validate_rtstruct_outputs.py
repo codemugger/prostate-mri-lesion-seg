@@ -70,6 +70,16 @@ def _prepared_mask(data: np.ndarray, slices: int) -> np.ndarray:
     )
 
 
+def _native_mask_3d(data: np.ndarray) -> np.ndarray:
+    """Normalize a single-slice NIfTI array without inventing spatial data."""
+    mask = np.asarray(data, dtype=bool)
+    if mask.ndim == 2:
+        mask = mask[:, :, np.newaxis]
+    if mask.ndim != 3:
+        raise ValueError(f"Expected a 2D/3D mask, got shape {mask.shape}")
+    return mask
+
+
 def _organ_rois(path: Path, slices: int) -> dict[str, np.ndarray]:
     data = np.asarray(nib.load(str(path)).get_fdata())
     if int(data.max()) >= 2:
@@ -162,30 +172,35 @@ def validate_case(case_directory: Path) -> dict[str, str]:
         cleaned_image = nib.load(
             str(case_directory / "organ" / "cleaned_organ.nii.gz")
         )
-        native_lesion = np.asarray(lesion_image.dataobj) > 0
-        native_cleaned = np.asarray(cleaned_image.dataobj) > 0
-        prostate_profile = build_single_outer_prostate_profile(
-            native_cleaned,
-            native_lesion,
-            cleaned_image.affine,
-        )
-        if not prostate_profile.accepted:
-            raise ValueError(
-                "Canonical prostate profile fails: "
-                + ";".join(prostate_profile.failed_gates)
-            )
+        native_lesion = _native_mask_3d(np.asarray(lesion_image.dataobj) > 0)
+        native_cleaned = _native_mask_3d(np.asarray(cleaned_image.dataobj) > 0)
+        if not native_cleaned.any() and native_lesion.any():
+            raise ValueError("Lesion mask is nonempty while organ mask is empty")
         lesion_rois, _ = build_lesion_rois(
             native_lesion,
             lesion_image.affine,
             _parse_lesion_scores(case_directory / "lesions.txt"),
         )
-        canonical_rois = {
-            "Prostate": np.transpose(prostate_profile.mask, (1, 0, 2)),
-            **{
-                lesion.name: np.transpose(lesion.mask, (1, 0, 2))
-                for lesion in lesion_rois
-            },
-        }
+        if native_cleaned.any():
+            prostate_profile = build_single_outer_prostate_profile(
+                native_cleaned,
+                native_lesion,
+                cleaned_image.affine,
+            )
+            if not prostate_profile.accepted:
+                raise ValueError(
+                    "Canonical prostate profile fails: "
+                    + ";".join(prostate_profile.failed_gates)
+                )
+            canonical_rois = {
+                "Prostate": np.transpose(prostate_profile.mask, (1, 0, 2)),
+                **{
+                    lesion.name: np.transpose(lesion.mask, (1, 0, 2))
+                    for lesion in lesion_rois
+                },
+            }
+        else:
+            canonical_rois = {}
         original_organ = _organ_rois(
             case_directory / "organ" / "organ.nii.gz",
             slice_count,

@@ -349,6 +349,12 @@ UroFusion `CLOSED_PLANAR` profile: prostate ROI 1, lesions ROI 2…N, one outer
 prostate contour per occupied T2 slice, and no prostate smoothing. Pinhole and
 keyhole encoding remain disabled.
 
+Sparse/non-contiguous selected T2 stacks are accepted only when their ordered
+slice grid, NIfTI affine envelope, SOP references, physical contour planes, and
+exact mask round trip all agree. A genuinely empty organ/lesion result still
+publishes a referenced combined RTSTRUCT with zero ROIs and zero contours so
+the output contract remains complete without fabricating anatomy.
+
 The SR is a DICOM Comprehensive SR referencing the selected T2 study. It
 contains cleaned-prostate LR/AP/SI dimensions (mm) and volume (mm³ and cm³),
 and is marked `COMPLETE`, `UNVERIFIED`, and not final pending clinical review.

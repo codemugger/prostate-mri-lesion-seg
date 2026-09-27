@@ -54,6 +54,17 @@ from typing import Optional
 CANONICAL_RTSTRUCT_LABEL = "AI_PROSTATE"
 
 
+def _case_reports_empty_organ(rtstruct_path: "os.PathLike[str] | str") -> bool:
+    """Return whether the sibling cleanup record proves an empty organ mask."""
+    metrics_path = Path(rtstruct_path).parent / "organ" / "cleanup_metrics.json"
+    try:
+        with metrics_path.open(encoding="utf-8") as metrics_file:
+            metrics = json.load(metrics_file)
+        return int(metrics.get("original_foreground_voxels", -1)) == 0
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
 def is_current_combined_rtstruct(path: "os.PathLike[str] | str") -> bool:
     """Return whether *path* has the accepted canonical RTSTRUCT profile.
 
@@ -79,6 +90,15 @@ def is_current_combined_rtstruct(path: "os.PathLike[str] | str") -> bool:
         rois = list(getattr(dataset, "StructureSetROISequence", []))
         contours = list(getattr(dataset, "ROIContourSequence", []))
         observations = list(getattr(dataset, "RTROIObservationsSequence", []))
+        if not rois:
+            # A selected case with a proven empty organ mask still receives a
+            # truthful combined Structure Set for output-contract parity. It
+            # must contain no fabricated ROI, contour, or observation items.
+            return (
+                not contours
+                and not observations
+                and _case_reports_empty_organ(path)
+            )
         expected = list(range(1, len(rois) + 1))
         if not rois or [int(item.ROINumber) for item in rois] != expected:
             return False

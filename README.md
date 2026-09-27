@@ -91,6 +91,7 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
   - `lesion_RTSTRUCT.dcm` — lesion contour(s).
   - `combined_organ_lesion_RTSTRUCT.dcm` — accepted UroFusion-compatible prostate plus separate lesion ROIs in one file.
 - The canonical combined file uses `CLOSED_PLANAR`, deterministic prostate-first ROI numbering, one outer prostate contour per occupied T2 slice, and one ROI per native lesion component. It is generated without prostate smoothing after PI-RADS classification. The three supporting organ/lesion RTSTRUCTs retain their established `CLOSEDPLANAR_XOR` representation.
+- Sparse/non-contiguous T2 test stacks are supported only when their array order, first/last affine envelope, parallel slice grid, source SOP references, exact contour planes, and voxel round trip all agree. A genuinely empty organ/lesion result still produces a referenced combined RTSTRUCT with zero ROIs and zero contours; no anatomy is fabricated.
 - Copy the pipeline-selected DICOM files for T2, ADC, and HIGHB into `output/dicom/` so radiologists can import DICOMs and RTSTRUCTs together into a viewer.
 
 
@@ -147,7 +148,7 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
 - RTSTRUCT and DICOM export (runs after lesion inference and classification):
   - Generates the three supporting RTSTRUCTs via `rtstruct_utils.generate_rtstruct_files()`, then atomically publishes the accepted canonical combined RTSTRUCT after lesion PI-RADS identities are available.
   - RTSTRUCTs are built from the exact T2 DICOM series the pipeline selected, matched by `SeriesInstanceUID` (not heuristic folder-name matching).
-  - The canonical combined RTSTRUCT uses only `CLOSED_PLANAR`, with one prostate contour per occupied T2 slice and separate numbered lesion ROIs. All contours reference their actual source T2 SOP Instance UID and are round-trip checked before publication.
+  - The canonical combined RTSTRUCT uses only `CLOSED_PLANAR`, with one prostate contour per occupied T2 slice and separate numbered lesion ROIs. All contours reference and lie on their actual source T2 SOP plane and are round-trip checked before publication. Empty segmentations publish a truthful zero-ROI Structure Set so the output contract remains complete.
   - SGH de-identified data often lacks the `StudyID` tag `(0020,0010)`, which crashes `rt_utils`. The code automatically patches `StudyID` from `AccessionNumber` in a temporary copy of the DICOM files.
   - Copies the pipeline-selected T2, ADC, and HIGHB DICOM series into `output/dicom/{t2,adc,highb}/` so radiologists can import DICOMs + RTSTRUCTs together into a viewer. For HIGHB, only the highest b‑value files are copied.
 

@@ -51,6 +51,7 @@ def _write_mr_slice(
     frame_uid: str,
     index: int,
     slice_count: int,
+    position: float | None = None,
 ) -> None:
     sop_uid = generate_uid()
     file_meta = FileMetaDataset()
@@ -87,7 +88,11 @@ def _write_mr_slice(
     dataset.PixelSpacing = [1.0, 1.0]
     dataset.SliceThickness = 1.0
     dataset.SpacingBetweenSlices = 1.0
-    dataset.ImagePositionPatient = [0.0, 0.0, float(index)]
+    dataset.ImagePositionPatient = [
+        0.0,
+        0.0,
+        float(index) if position is None else float(position),
+    ]
     dataset.ImageOrientationPatient = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
     dataset.PixelData = np.full((48, 48), index, dtype=np.uint16).tobytes()
     dataset.save_as(path, enforce_file_format=True)
@@ -223,6 +228,142 @@ class LesionMappingTests(unittest.TestCase):
 
 
 class CanonicalRTStructTests(unittest.TestCase):
+    def test_nonuniform_t2_stack_uses_actual_slice_sops_and_roundtrips(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            case = Path(temporary_directory) / "case"
+            _create_case(case, 1)
+            positions = np.asarray(
+                [0, 1, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18, 19, 21, 22, 24],
+                dtype=float,
+            )
+            sop_positions: dict[str, float] = {}
+            for path, position in zip(
+                sorted((case / "dicom/t2").glob("*.dcm")),
+                positions,
+            ):
+                dataset = pydicom.dcmread(path)
+                dataset.ImagePositionPatient = [0.0, 0.0, position]
+                sop_positions[str(dataset.SOPInstanceUID)] = float(position)
+                dataset.save_as(path, enforce_file_format=True)
+
+            average_spacing = float(
+                (positions[-1] - positions[0]) / (len(positions) - 1)
+            )
+            for relative_path in (
+                "organ/cleaned_organ.nii.gz",
+                "organ/organ.nii.gz",
+                "lesion/lesion_mask.nii.gz",
+            ):
+                path = case / relative_path
+                image = nib.load(path)
+                affine = image.affine.copy()
+                affine[2, 2] = average_spacing
+                nib.save(
+                    nib.Nifti1Image(
+                        np.asarray(image.dataobj),
+                        affine,
+                        header=image.header.copy(),
+                    ),
+                    path,
+                )
+
+            result = generate_accepted_rtstruct(case)
+            self.assertTrue(result["validation"]["valid"])
+            self.assertTrue(
+                all(
+                    difference == 0
+                    for difference in result["validation"][
+                        "round_trip_different_voxels"
+                    ].values()
+                )
+            )
+            self.assertGreater(
+                len(set(np.round(result["source_slice_spacings_mm"], 6))),
+                1,
+            )
+
+            dataset = pydicom.dcmread(
+                case / "combined_organ_lesion_RTSTRUCT.dcm"
+            )
+            for roi in dataset.ROIContourSequence:
+                for contour in roi.ContourSequence:
+                    reference = contour.ContourImageSequence[0]
+                    expected_position = sop_positions[
+                        str(reference.ReferencedSOPInstanceUID)
+                    ]
+                    points = np.asarray(contour.ContourData, dtype=float).reshape(-1, 3)
+                    np.testing.assert_allclose(
+                        points[:, 2],
+                        expected_position,
+                        rtol=0.0,
+                        atol=1e-6,
+                    )
+
+    def test_sparse_stack_with_wrong_nifti_envelope_still_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            case = Path(temporary_directory) / "case"
+            _create_case(case, 1)
+            positions = [float(index * index) for index in range(17)]
+            for path, position in zip(
+                sorted((case / "dicom/t2").glob("*.dcm")),
+                positions,
+            ):
+                dataset = pydicom.dcmread(path)
+                dataset.ImagePositionPatient = [0.0, 0.0, position]
+                dataset.save_as(path, enforce_file_format=True)
+
+            with self.assertRaisesRegex(GeometryMismatchError, "does not match"):
+                generate_accepted_rtstruct(case)
+            self.assertFalse(
+                (case / "combined_organ_lesion_RTSTRUCT.dcm").exists()
+            )
+
+    def test_empty_single_slice_publishes_zero_roi_structure_set(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            case = Path(temporary_directory) / "case"
+            t2 = case / "dicom/t2"
+            organ = case / "organ"
+            lesion = case / "lesion"
+            t2.mkdir(parents=True)
+            organ.mkdir(parents=True)
+            lesion.mkdir(parents=True)
+            _write_mr_slice(
+                t2 / "slice.dcm",
+                study_uid=generate_uid(),
+                series_uid=generate_uid(),
+                frame_uid=generate_uid(),
+                index=0,
+                slice_count=1,
+                position=25.0,
+            )
+            empty_2d = np.zeros((48, 48), dtype=np.uint8)
+            nib.save(
+                nib.Nifti1Image(empty_2d, np.eye(4)),
+                organ / "cleaned_organ.nii.gz",
+            )
+            nib.save(
+                nib.Nifti1Image(empty_2d[:, :, np.newaxis], np.eye(4)),
+                lesion / "lesion_mask.nii.gz",
+            )
+            (case / "lesions.txt").write_text("[]\n", encoding="utf-8")
+
+            result = generate_accepted_rtstruct(case)
+
+            self.assertTrue(result["empty_segmentation"])
+            self.assertEqual(result["contour_count"], 0)
+            self.assertEqual(
+                result["roi_numbers"],
+                {"structure_set": [], "contours": [], "observations": []},
+            )
+            dataset = pydicom.dcmread(
+                case / "combined_organ_lesion_RTSTRUCT.dcm"
+            )
+            self.assertEqual(len(dataset.StructureSetROISequence), 0)
+            self.assertEqual(len(dataset.ROIContourSequence), 0)
+            self.assertEqual(len(dataset.RTROIObservationsSequence), 0)
+            self.assertEqual(dataset.StructureSetLabel, "AI_PROSTATE")
+            self.assertEqual(dataset.ApprovalStatus, "UNAPPROVED")
+
     def test_independent_four_file_validator_accepts_mixed_profiles(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             case = Path(temporary_directory) / "case"

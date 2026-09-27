@@ -115,6 +115,30 @@ class CaseStatusTests(unittest.TestCase):
             status = inspect_case(root, patient_id="TEST")
             self.assertEqual(status.status, Status.FAIL_RTSTRUCT)
 
+    def test_empty_canonical_rtstruct_requires_proven_empty_organ(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._create_complete_case(root)
+            rtstruct_path = root / EXPECTED_FILES["combined_rtstruct"]
+            dataset = pydicom.dcmread(rtstruct_path)
+            dataset.StructureSetROISequence = []
+            dataset.ROIContourSequence = []
+            dataset.RTROIObservationsSequence = []
+            pydicom.dcmwrite(rtstruct_path, dataset, enforce_file_format=True)
+
+            self.assertFalse(is_current_combined_rtstruct(rtstruct_path))
+
+            metrics_path = root / EXPECTED_FILES["cleanup_metrics"]
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            metrics["original_foreground_voxels"] = 0
+            metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
+            for relative_path in LESION_FOLD_FILES:
+                (root / relative_path).unlink()
+
+            self.assertTrue(is_current_combined_rtstruct(rtstruct_path))
+            status = inspect_case(root, patient_id="TEST")
+            self.assertEqual(status.status, Status.SUCCESS_EMPTY_LESION)
+
     def test_missing_sr_is_reporting_failure(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

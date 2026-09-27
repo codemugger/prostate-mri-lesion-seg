@@ -33,6 +33,20 @@ individual patient's model segmentation.
   rejects grid/reference mismatches and validates exact mask round trips before
   atomic publication.
 
+## Sparse and empty test-series behavior
+
+- A sparse/non-contiguous T2 stack may be exported only when its slice count,
+  in-plane grid, first/last NIfTI affine envelope, parallel DICOM slice grid,
+  and ordered source images agree. Every contour is translated onto the exact
+  physical plane of its referenced source SOP and revalidated there.
+- If both the cleaned organ and lesion masks are genuinely empty, the combined
+  file is still published for output-contract parity. It contains zero ROIs
+  and zero contours while retaining truthful source-study, series, frame, and
+  image references. No placeholder prostate or lesion anatomy is created.
+- A nonempty single-slice mask without trustworthy patient-space geometry, a
+  nonempty lesion with an empty gland, duplicate planes, tilted/misaligned
+  grids, or any round-trip difference remains a hard failure.
+
 ## One-lesion versus two-lesion viewer presentation
 
 The tested one- and two-lesion RTSTRUCTs both use the same flat DICOM structure.
