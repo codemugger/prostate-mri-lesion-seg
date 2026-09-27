@@ -45,7 +45,7 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
   - `output/organ/organ_RTSTRUCT.dcm` — original organ zones (kept for reference/review by radiologists)
   - `output/organ/cleaned_organ_RTSTRUCT.dcm` — cleaned organ zones (islands removed, clinically accurate)
   - `output/lesion/lesion_RTSTRUCT.dcm` — lesion contours only (ROI: `Lesion` red)
-  - `output/combined_organ_lesion_RTSTRUCT.dcm` — **combined** cleaned organ zones + lesion contours in a single file for convenient loading in clinical viewers (e.g. CARPL)
+  - `output/combined_organ_lesion_RTSTRUCT.dcm` — canonical UroFusion-compatible file: ROI 1 is `Prostate`; ROI 2…N are separate lesions labelled `Lesion N - AI PI-RADS X`
 - Copies of the pipeline-selected DICOM series (for importing alongside RTSTRUCTs into a viewer)
   - `output/dicom/t2/` — T2 DICOM files
   - `output/dicom/adc/` — ADC DICOM files
@@ -89,8 +89,8 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
   - `organ_RTSTRUCT.dcm` — original organ zones (for reference/review).
   - `cleaned_organ_RTSTRUCT.dcm` — cleaned organ zones (islands removed, clinically accurate).
   - `lesion_RTSTRUCT.dcm` — lesion contour(s).
-  - `combined_organ_lesion_RTSTRUCT.dcm` — cleaned organ + lesion ROIs in a single file.
-- Contours use standards-based `CLOSEDPLANAR_XOR` encoding with pinhole/keyhole cuts disabled. Point- or line-like components are represented as valid sub-pixel polygons instead of being discarded, and contour approximation is disabled so the RTSTRUCT rasterizes exactly back to the exported mask.
+  - `combined_organ_lesion_RTSTRUCT.dcm` — accepted UroFusion-compatible prostate plus separate lesion ROIs in one file.
+- The canonical combined file uses `CLOSED_PLANAR`, deterministic prostate-first ROI numbering, one outer prostate contour per occupied T2 slice, and one ROI per native lesion component. It is generated without prostate smoothing after PI-RADS classification. The three supporting organ/lesion RTSTRUCTs retain their established `CLOSEDPLANAR_XOR` representation.
 - Copy the pipeline-selected DICOM files for T2, ADC, and HIGHB into `output/dicom/` so radiologists can import DICOMs and RTSTRUCTs together into a viewer.
 
 
@@ -144,10 +144,10 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
 - Post-processing:
   - Multiply merged probabilities by the cleaned organ mask (removes non-prostate detections).
   - Fixed threshold (0.63) → `lesion_mask.nii.gz`.
-- RTSTRUCT and DICOM export (runs after lesion inference):
-  - Generates four RTSTRUCT files via `rtstruct_utils.generate_rtstruct_files()` — original organ, cleaned organ, lesion, and combined (see Outputs above).
+- RTSTRUCT and DICOM export (runs after lesion inference and classification):
+  - Generates the three supporting RTSTRUCTs via `rtstruct_utils.generate_rtstruct_files()`, then atomically publishes the accepted canonical combined RTSTRUCT after lesion PI-RADS identities are available.
   - RTSTRUCTs are built from the exact T2 DICOM series the pipeline selected, matched by `SeriesInstanceUID` (not heuristic folder-name matching).
-  - Separate `CLOSEDPLANAR_XOR` contours preserve inner/outer boundaries without the visible connector lines produced by `rt-utils` pinhole encoding. Degenerate OpenCV contours are repaired into valid pixel-footprint polygons and round-trip checked by the validation harness.
+  - The canonical combined RTSTRUCT uses only `CLOSED_PLANAR`, with one prostate contour per occupied T2 slice and separate numbered lesion ROIs. All contours reference their actual source T2 SOP Instance UID and are round-trip checked before publication.
   - SGH de-identified data often lacks the `StudyID` tag `(0020,0010)`, which crashes `rt_utils`. The code automatically patches `StudyID` from `AccessionNumber` in a temporary copy of the DICOM files.
   - Copies the pipeline-selected T2, ADC, and HIGHB DICOM series into `output/dicom/{t2,adc,highb}/` so radiologists can import DICOMs + RTSTRUCTs together into a viewer. For HIGHB, only the highest b‑value files are copied.
 
@@ -299,7 +299,7 @@ Running without `-r` is a fresh batch and clears the selected output root
 before processing. Do not point it at results that must be retained.
 
 Batch processing features:
-- **Resume mode** (`-r`): skips complete cases based on required artifact presence; incomplete/legacy outputs are cleared and rerun. Resume cannot identify an internal format revision when all expected files already exist. For example, a complete case containing an older keyhole RTSTRUCT will be skipped rather than regenerated with `CLOSEDPLANAR_XOR`. Use a new output root, run a fresh batch without `-r`, or remove the specific case directory before resuming.
+- **Resume mode** (`-r`): skips only cases with all required artifacts and a combined RTSTRUCT matching the accepted `AI_PROSTATE` profile. Existing cases with an older combined RTSTRUCT are treated as legacy and rerun.
 - **Cooldown** (`--cooldown SECS`): pauses between cases to prevent thermal issues (default 30 s).
 - **Single-writer lock**: rejects a second batch targeting the same output root, preventing output/audit corruption.
 - **Audit CSV** (`--audit-csv PATH`): writes status, missing modalities, cleanup metrics, elapsed time, and file-presence flags (default `<output>/batch_audit_log.csv`).
@@ -307,7 +307,7 @@ Batch processing features:
 - Status vocabulary: `SUCCESS_COMPLETE`, `SUCCESS_EMPTY_LESION`, `FAIL_MISSING_MODALITY`, `FAIL_ORGAN_SEG`, `FAIL_POSTPROCESSING`, `FAIL_LESION_SEG`, `FAIL_CLASSIFIER`, `FAIL_REPORTING`, `FAIL_RTSTRUCT`, `FAIL_RUNTIME`, `FAIL_EMPTY_OUTPUT`, `SKIPPED_RESUME`.
 
 In summary:
-- A new local inference run produces the latest outputs, including no-keyhole `CLOSEDPLANAR_XOR` RTSTRUCTs.
+- A new local inference run automatically produces the accepted UroFusion-compatible canonical combined RTSTRUCT; no review flag is required.
 - A Docker/HIVE inference run produces them only after rebuilding and loading the updated image.
 - A complete case skipped by `-r` keeps its existing files and encoding.
 
@@ -334,7 +334,7 @@ exclusion, and never interprets a missing lesion mask as a negative label.
 ```bash
 python scripts/prepare_training_data.py \
   --audit-csv audit_assignments.csv \
-  --sgh-output-root "/path/to/Interesting outputs" \
+  --sgh-output-root "/path/to/full/HIVE/output" \
   --prostatex-root data/preprocessed \
   --output-dir artifacts/training
 ```
@@ -383,15 +383,19 @@ done
 
 Each run writes a stable `model_best_foldN.pth.tar`, a full resumable last
 checkpoint, `metrics.csv`, `run_summary.json`, the resolved config, and
-TensorBoard events. Monitor all runs with:
+TensorBoard events. The default configs also retain full checkpoints every
+50 epochs; organ snapshots include a deployable TorchScript `.ts` copy.
+Monitor all runs with:
 
 ```bash
 tensorboard --logdir experiments --bind_all --port 6006
 ```
 
-The notebooks in `notebooks/train_organ.ipynb` and
-`notebooks/train_lesion.ipynb` are thin front ends to these same commands;
-the YAML files remain the single source of parameters.
+The HIVE notebooks in `hive_train_organ.ipynb` and
+`hive_train_lesion.ipynb` are guarded front ends to these same commands.
+They verify that exactly one GPU is visible, prevent concurrent jobs on the
+selected GPU, support resume, show progress, and package the best completed
+runs. The YAML files remain the single source of model/training parameters.
 
 ### Package drop-in models
 
@@ -544,7 +548,7 @@ There are several scripts to help with running, validation, deployment, and deve
 - `scripts/compare_output.sh`: Computes organ and lesion DICE scores for two output directories.
 - `scripts/eval_dice.py`: Loads two NIfTI files and computes mean DICE (called by `compare_output.sh`).
 - `scripts/compare_batch_outputs.py`: Produces a per-case CSV and JSON regression summary for a new batch versus a prior output. It checks input/original-organ identity, quantifies cleaned-organ and lesion changes, and validates each generated DICOM SR against its T2 study.
-- `scripts/validate_rtstruct_outputs.py`: Strictly validates all four RTSTRUCTs per case: SOP/study/T2 references, ROI names, `CLOSEDPLANAR_XOR` use, minimum polygon geometry, DICOM short-string limits, and exact RTSTRUCT-to-NIfTI voxel round trips.
+- `scripts/validate_rtstruct_outputs.py`: Strictly validates all four RTSTRUCTs per case: SOP/study/T2 references, ROI names and numbering, expected contour geometry (`CLOSEDPLANAR_XOR` for supporting files and `CLOSED_PLANAR` for the canonical combined file), minimum polygon geometry, DICOM short-string limits, and exact mask round trips.
 - `scripts/validate_selection_rules.py`: Validates T2/ADC/HIGHB selection rules (from `app.py`) against an annotated ground-truth CSV. Reports precision, recall, F1, and lists false positives / negatives per class.
 - `tests/`: standard-library `unittest` guardrails for connected-component cleanup, hole filling, affine-aware measurements, DICOM SR parsing, exact no-keyhole RTSTRUCT round trips, and audit status classification:
   ```bash

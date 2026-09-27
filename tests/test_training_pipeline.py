@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -17,11 +20,21 @@ from training.cohort import (
     write_csv,
 )
 from training.datasets import select_records
-from training.engine import build_model
+from training.engine import (
+    _continued_run_dir,
+    _enforce_requested_gpu_visibility,
+    _scheduler,
+    _validate_config_contract,
+    build_model,
+)
 from training.export import load_weights, package_deployment_bundle
 from training.inference_tiler import inference_ranges, lesion_tiled_predict
 from training.losses import ProbabilityDiceFocalLoss
 from training.metrics import lesion_detection_counts
+from training.transforms import (
+    get_organ_train_transforms,
+    get_organ_val_transforms,
+)
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -109,6 +122,140 @@ class CohortPolicyTests(unittest.TestCase):
 
 
 class TrainingContractTests(unittest.TestCase):
+    def test_organ_affine_augmentation_preserves_exact_patch_shape(self):
+        import nibabel as nib
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = np.random.default_rng(42).normal(
+                size=(132, 131, 18)
+            ).astype(np.float32)
+            label = np.zeros_like(image, dtype=np.uint8)
+            label[35:95, 35:95, 3:15] = 1
+            image_path = root / "image.nii.gz"
+            label_path = root / "label.nii.gz"
+            nib.save(nib.Nifti1Image(image, np.eye(4)), image_path)
+            nib.save(nib.Nifti1Image(label, np.eye(4)), label_path)
+
+            transform = get_organ_train_transforms(
+                spacing=(1.0, 1.0, 1.0),
+                roi_size=(128, 128, 16),
+                samples_per_image=2,
+                pos_to_neg=1.0,
+            )
+            for _ in range(20):
+                samples = transform(
+                    {"image": str(image_path), "label": str(label_path)}
+                )
+                self.assertEqual(len(samples), 2)
+                for sample in samples:
+                    self.assertEqual(
+                        tuple(sample["image"].shape), (1, 128, 128, 16)
+                    )
+                    self.assertEqual(
+                        tuple(sample["label"].shape), (1, 128, 128, 16)
+                    )
+                    np.testing.assert_allclose(
+                        sample["image"].affine,
+                        sample["label"].affine,
+                        rtol=1e-6,
+                        atol=1e-6,
+                    )
+
+    def test_organ_validation_resamples_label_to_exact_image_grid(self):
+        import nibabel as nib
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = np.zeros((64, 65, 9), dtype=np.float32)
+            label = np.zeros((80, 78, 9), dtype=np.uint8)
+            label[20:60, 18:58, 2:7] = 1
+            image_affine = np.diag([0.8, 0.8, 3.0, 1.0])
+            label_affine = np.diag([0.64, 2.0 / 3.0, 3.0, 1.0])
+            label_affine[:3, 3] = (0.25, -0.4, 0.0)
+            image_path = root / "image.nii.gz"
+            label_path = root / "label.nii.gz"
+            nib.save(nib.Nifti1Image(image, image_affine), image_path)
+            nib.save(nib.Nifti1Image(label, label_affine), label_path)
+
+            sample = get_organ_val_transforms((1.0, 1.0, 1.0))(
+                {"image": str(image_path), "label": str(label_path)}
+            )
+            self.assertEqual(sample["image"].shape, sample["label"].shape)
+            np.testing.assert_allclose(
+                sample["image"].affine,
+                sample["label"].affine,
+                rtol=1e-6,
+                atol=1e-6,
+            )
+
+    def test_hive_single_gpu_guard_fails_closed(self):
+        with mock.patch.dict(os.environ, {"HIVE_REQUIRE_SINGLE_GPU": "1"}):
+            with mock.patch(
+                "training.engine.torch.cuda.device_count", return_value=2
+            ):
+                with self.assertRaisesRegex(RuntimeError, "PyTorch can see 2"):
+                    _enforce_requested_gpu_visibility()
+
+    def test_resume_continues_original_run_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory) / "run"
+            checkpoints = run / "checkpoints"
+            checkpoints.mkdir(parents=True)
+            (run / "resolved_config.yaml").write_text("train: {}\n")
+            (run / "cohort_provenance.json").write_text("{}\n")
+            last = run / "model_last.pth.tar"
+            snapshot = checkpoints / "model_epoch_0050.pth.tar"
+            last.write_bytes(b"last")
+            snapshot.write_bytes(b"snapshot")
+            self.assertEqual(_continued_run_dir(last), run)
+            self.assertEqual(_continued_run_dir(snapshot), run)
+
+    def test_default_configs_retain_periodic_snapshots(self):
+        expected_intervals = {"organ": 50, "lesion": 10}
+        for name, expected_interval in expected_intervals.items():
+            config = yaml.safe_load((REPOSITORY / f"configs/{name}.yaml").read_text())
+            self.assertEqual(
+                config["output"]["snapshot_interval"], expected_interval
+            )
+            self.assertEqual(
+                config["scheduler"]["t_max"], config["train"]["epochs"]
+            )
+            _validate_config_contract(config, task=name)
+
+    def test_scheduler_rejects_accidental_cosine_cycles(self):
+        config = yaml.safe_load((REPOSITORY / "configs/lesion.yaml").read_text())
+        config["scheduler"]["t_max"] = config["train"]["epochs"] - 1
+        model = build_model(config)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        with self.assertRaisesRegex(ValueError, "must equal train.epochs"):
+            _scheduler(config, optimizer)
+
+    def test_lesion_hive_plan_is_sequential_and_conservative(self):
+        config = yaml.safe_load((REPOSITORY / "configs/lesion.yaml").read_text())
+        self.assertEqual(config["train"]["epochs"], 50)
+        self.assertEqual(config["scheduler"]["t_max"], 50)
+        self.assertEqual(config["train"]["lr"], 1e-4)
+        self.assertEqual(config["train"]["grad_accum_steps"], 2)
+        self.assertEqual(config["train"]["val_interval"], 1)
+        self.assertEqual(config["output"]["save_last_interval"], 1)
+        self.assertEqual(config["output"]["snapshot_interval"], 10)
+
+        notebook = json.loads(
+            (REPOSITORY / "hive_train_lesion.ipynb").read_text()
+        )
+        code = "\n".join(
+            "".join(cell.get("source", []))
+            for cell in notebook["cells"]
+            if cell.get("cell_type") == "code"
+        )
+        self.assertIn("START_ALL_FOLDS = False", code)
+        self.assertIn("FOLDS_TO_TRAIN = list(range(5))", code)
+        self.assertIn(
+            "for position, fold in enumerate(FOLDS_TO_TRAIN", code
+        )
+        self.assertNotIn("ThreadPoolExecutor", code)
+
     def test_manifest_join_never_uses_held_out_cases(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -57,3 +57,5 @@ validation:
 output:
   exp_dir: experiments/organ
   save_last_interval: 1
+  # Full resumable checkpoint plus a deployable TorchScript copy every 50 epochs.
+  snapshot_interval: 50

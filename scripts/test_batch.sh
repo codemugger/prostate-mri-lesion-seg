@@ -188,6 +188,14 @@ log_case_status() {
     "$AUDIT_PY" "${args[@]}" || echo "  WARNING: audit log append failed for $pid"
 }
 
+has_current_combined_rtstruct() {
+    local rtstruct_path="$1"
+    if [ -z "$AUDIT_PY" ]; then
+        return 1
+    fi
+    "$AUDIT_PY" "$CASE_STATUS_PY" check-rtstruct "$rtstruct_path" >/dev/null 2>&1
+}
+
 # Loop over patient subdirectories
 for PATIENT_DIR in "$INPUT_ROOT_DIR"/*/; do
     [ -d "$PATIENT_DIR" ] || continue
@@ -214,7 +222,8 @@ for PATIENT_DIR in "$INPUT_ROOT_DIR"/*/; do
             && [ -f "$CASE_OUTPUT_DIR/lesion/lesion_RTSTRUCT.dcm" ] \
             && [ -f "$CASE_OUTPUT_DIR/lesions.txt" ] \
             && [ -f "$CASE_OUTPUT_DIR/prostate_measurements_SR.dcm" ] \
-            && [ -f "$CASE_OUTPUT_DIR/combined_organ_lesion_RTSTRUCT.dcm" ]; then
+            && [ -f "$CASE_OUTPUT_DIR/combined_organ_lesion_RTSTRUCT.dcm" ] \
+            && has_current_combined_rtstruct "$CASE_OUTPUT_DIR/combined_organ_lesion_RTSTRUCT.dcm"; then
             echo "  SKIPPING (resume mode, complete current-format output; $FILE_COUNT image files)"
             SKIPPED=$((SKIPPED + 1))
             # Log the skipped case too -- but only if it is not already

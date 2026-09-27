@@ -91,11 +91,56 @@ def _scheduler(cfg: Mapping[str, Any], optimizer):
     scheduler_cfg = cfg["scheduler"]
     if str(scheduler_cfg["type"]).lower() != "cosine_anneal":
         raise ValueError(f"Unsupported scheduler: {scheduler_cfg['type']}")
+    epochs = int(cfg["train"]["epochs"])
+    t_max = int(scheduler_cfg.get("t_max", epochs))
+    if t_max != epochs:
+        raise ValueError(
+            "scheduler.t_max must equal train.epochs for a single cosine "
+            f"annealing run (got t_max={t_max}, epochs={epochs}). "
+            "Use a dedicated warm-restart scheduler if cycles are intended."
+        )
     return torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=int(scheduler_cfg.get("t_max", cfg["train"]["epochs"])),
+        T_max=t_max,
         eta_min=float(scheduler_cfg.get("eta_min", 1e-6)),
     )
+
+
+def _validate_config_contract(cfg: Mapping[str, Any], *, task: str) -> None:
+    """Reject unsafe or architecture-incompatible training settings early."""
+    train_cfg = cfg["train"]
+    output_cfg = cfg["output"]
+    epochs = int(train_cfg["epochs"])
+    if epochs < 1:
+        raise ValueError("train.epochs must be >= 1")
+    t_max = int(cfg["scheduler"].get("t_max", epochs))
+    if t_max != epochs:
+        raise ValueError(
+            "scheduler.t_max must equal train.epochs for a single cosine "
+            f"annealing run (got t_max={t_max}, epochs={epochs})"
+        )
+    for key in ("batch_size", "grad_accum_steps", "val_interval", "log_interval"):
+        if int(train_cfg[key]) < 1:
+            raise ValueError(f"train.{key} must be >= 1")
+    if int(output_cfg["save_last_interval"]) < 1:
+        raise ValueError("output.save_last_interval must be >= 1")
+    if int(output_cfg.get("snapshot_interval", 0)) < 0:
+        raise ValueError("output.snapshot_interval must be >= 0")
+
+    patch = tuple(int(value) for value in cfg["preprocess"]["patch_size"])
+    required_multiple = 16 if task == "organ" else 32
+    if len(patch) != 3 or any(
+        size < required_multiple or size % required_multiple for size in patch
+    ):
+        raise ValueError(
+            f"{task} preprocess.patch_size must contain three dimensions "
+            f"divisible by {required_multiple}; got {patch}"
+        )
+    if task == "lesion":
+        for key in ("threshold", "ensemble_threshold"):
+            threshold = float(cfg["validation"][key])
+            if not 0.0 < threshold < 1.0:
+                raise ValueError(f"validation.{key} must be between 0 and 1")
 
 
 def _run_dir(cfg: Mapping[str, Any], task: str, fold: int | None) -> Path:
@@ -122,6 +167,7 @@ def _save_checkpoint(
     fold: int | None,
     cfg: Mapping[str, Any],
 ) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -139,6 +185,20 @@ def _save_checkpoint(
     temporary.replace(path)
 
 
+def _enforce_requested_gpu_visibility() -> None:
+    """Fail closed when a HIVE job is required to see exactly one GPU."""
+    required = str(os.environ.get("HIVE_REQUIRE_SINGLE_GPU", "")).strip().lower()
+    if required not in {"1", "true", "yes", "y"}:
+        return
+    visible = torch.cuda.device_count()
+    if visible != 1:
+        raise RuntimeError(
+            "HIVE_REQUIRE_SINGLE_GPU is enabled, but PyTorch can see "
+            f"{visible} CUDA devices. Start the container with "
+            "'--gpus device=<one GPU>' and do not continue until this is 1."
+        )
+
+
 def _load_resume(
     path: str | Path,
     model,
@@ -149,6 +209,7 @@ def _load_resume(
     *,
     task: str,
     fold: int | None,
+    cfg: Mapping[str, Any],
 ):
     payload = torch.load(path, map_location=device, weights_only=False)
     if payload.get("task") not in {None, task}:
@@ -159,6 +220,12 @@ def _load_resume(
         raise ValueError(
             f"Resume checkpoint fold={payload.get('fold')} does not match {fold}"
         )
+    checkpoint_cfg = payload.get("config")
+    if checkpoint_cfg is not None and checkpoint_cfg != dict(cfg):
+        raise ValueError(
+            "The current YAML config differs from the config stored in the "
+            "resume checkpoint. Restore the original config or start a new run."
+        )
     model.load_state_dict(payload["state_dict"], strict=True)
     optimizer.load_state_dict(payload["optimizer_state_dict"])
     scheduler.load_state_dict(payload["scheduler_state_dict"])
@@ -167,6 +234,19 @@ def _load_resume(
     return int(payload["epoch"]) + 1, float(
         payload.get("best_metric", payload.get("best_dice", -1.0))
     )
+
+
+def _continued_run_dir(resume: str | Path) -> Path | None:
+    """Return the original run directory for one of our resumable checkpoints."""
+    checkpoint = Path(resume).resolve()
+    candidate = checkpoint.parent
+    if candidate.name == "checkpoints":
+        candidate = candidate.parent
+    markers = (
+        candidate / "resolved_config.yaml",
+        candidate / "cohort_provenance.json",
+    )
+    return candidate if all(path.is_file() for path in markers) else None
 
 
 def _data_loaders(
@@ -331,6 +411,12 @@ def _validate_organ(model, loader, device, cfg) -> dict[str, float]:
             prediction = torch.argmax(logits, dim=1)[0].cpu().numpy()
             target = batch["label"][0, 0].cpu().numpy() > 0
             cleaned, _ = clean_binary_organ_mask(prediction)
+            if cleaned.shape != target.shape:
+                raise RuntimeError(
+                    "Organ validation image/label grids differ after "
+                    f"ResampleToMatchd: prediction={cleaned.shape}, "
+                    f"target={target.shape}"
+                )
             metrics.update(cleaned, target)
     return metrics.compute()
 
@@ -368,8 +454,10 @@ def train_from_config(
         fold = None
     if output_dir is not None:
         cfg["output"]["exp_dir"] = str(output_dir)
+    _validate_config_contract(cfg, task=task)
 
     seed = int(cfg["train"]["seed"]) + (fold or 0)
+    _enforce_requested_gpu_visibility()
     set_determinism(
         seed=seed,
         additional_settings=None,
@@ -422,10 +510,19 @@ def train_from_config(
             device,
             task=task,
             fold=fold,
+            cfg=cfg,
         )
         print(f"Resumed from {resume} at epoch {start_epoch}", flush=True)
+        if start_epoch > int(cfg["train"]["epochs"]):
+            raise ValueError(
+                f"Checkpoint already completed epoch {start_epoch - 1}; "
+                f"configured training ends at epoch {cfg['train']['epochs']}"
+            )
 
-    run_dir = _run_dir(cfg, task, fold)
+    continued_dir = _continued_run_dir(resume) if resume is not None else None
+    run_dir = continued_dir or _run_dir(cfg, task, fold)
+    if continued_dir is not None:
+        print(f"Continuing original run directory: {run_dir}", flush=True)
     metrics_csv = run_dir / "metrics.csv"
     (run_dir / "resolved_config.yaml").write_text(
         yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8"
@@ -460,6 +557,10 @@ def train_from_config(
     last_path = run_dir / f"model_last{suffix}.pth.tar"
     deploy_path = run_dir / "model.ts" if task == "organ" else best_path
     epochs = int(cfg["train"]["epochs"])
+    snapshot_interval = int(cfg["output"].get("snapshot_interval", 0))
+    if snapshot_interval < 0:
+        raise ValueError("output.snapshot_interval must be >= 0")
+    snapshot_dir = run_dir / "checkpoints"
     started = time.monotonic()
 
     for epoch in range(start_epoch, epochs + 1):
@@ -521,6 +622,29 @@ def train_from_config(
                 cfg=cfg,
             )
 
+        if snapshot_interval and epoch % snapshot_interval == 0:
+            snapshot_path = (
+                snapshot_dir / f"model_epoch_{epoch:04d}{suffix}.pth.tar"
+            )
+            _save_checkpoint(
+                snapshot_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=epoch,
+                best_metric=best_metric,
+                task=task,
+                fold=fold,
+                cfg=cfg,
+            )
+            if task == "organ":
+                export_organ_torchscript(
+                    model,
+                    snapshot_dir / f"model_epoch_{epoch:04d}.ts",
+                )
+            print(f"  periodic epoch snapshot: {snapshot_path}", flush=True)
+
         row: dict[str, Any] = {
             "epoch": epoch,
             "train_loss": train_loss,
@@ -551,6 +675,9 @@ def train_from_config(
         "best_checkpoint": str(best_path),
         "last_checkpoint": str(last_path),
         "deployment_model": str(deploy_path),
+        "periodic_checkpoints": [
+            str(path) for path in sorted(snapshot_dir.glob("model_epoch_*.pth.tar"))
+        ],
         "elapsed_minutes": (time.monotonic() - started) / 60.0,
         "manifest_sha256": provenance["manifest_sha256"],
         "split_sha256": provenance["split_sha256"],

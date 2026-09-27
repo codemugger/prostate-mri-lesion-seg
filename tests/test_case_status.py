@@ -6,6 +6,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pydicom
+from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
+from pydicom.uid import (
+    ExplicitVRLittleEndian,
+    PYDICOM_IMPLEMENTATION_UID,
+    RTStructureSetStorage,
+    generate_uid,
+)
+
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
@@ -18,7 +27,40 @@ from case_status import (  # noqa: E402
     Status,
     append_csv_row,
     inspect_case,
+    is_current_combined_rtstruct,
 )
+
+
+def _write_current_combined_rtstruct(path: Path) -> None:
+    file_meta = FileMetaDataset()
+    file_meta.MediaStorageSOPClassUID = RTStructureSetStorage
+    file_meta.MediaStorageSOPInstanceUID = generate_uid()
+    file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    file_meta.ImplementationClassUID = PYDICOM_IMPLEMENTATION_UID
+    dataset = FileDataset(str(path), {}, file_meta=file_meta, preamble=b"\0" * 128)
+    dataset.SOPClassUID = RTStructureSetStorage
+    dataset.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+    dataset.StructureSetLabel = "AI_PROSTATE"
+    dataset.ApprovalStatus = "UNAPPROVED"
+
+    roi = Dataset()
+    roi.ROINumber = 1
+    roi.ROIName = "Prostate"
+    roi.ROIGenerationAlgorithm = "AUTOMATIC"
+    dataset.StructureSetROISequence = [roi]
+
+    polygon = Dataset()
+    polygon.ContourGeometricType = "CLOSED_PLANAR"
+    roi_contour = Dataset()
+    roi_contour.ReferencedROINumber = 1
+    roi_contour.ContourSequence = [polygon]
+    dataset.ROIContourSequence = [roi_contour]
+
+    observation = Dataset()
+    observation.ReferencedROINumber = 1
+    observation.RTROIInterpretedType = "ORGAN"
+    dataset.RTROIObservationsSequence = [observation]
+    pydicom.dcmwrite(path, dataset, enforce_file_format=True)
 
 
 class CaseStatusTests(unittest.TestCase):
@@ -45,6 +87,9 @@ class CaseStatusTests(unittest.TestCase):
             path = root / relative_path
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch()
+        _write_current_combined_rtstruct(
+            root / EXPECTED_FILES["combined_rtstruct"]
+        )
 
     def test_complete_current_output(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -56,6 +101,19 @@ class CaseStatusTests(unittest.TestCase):
             self.assertEqual(status.status, Status.SUCCESS_COMPLETE)
             self.assertEqual(status.cleanup_metrics["status"], "CLEANED")
             self.assertTrue(status.file_flags["prostate_sr"])
+
+    def test_legacy_combined_rtstruct_is_not_current(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._create_complete_case(root)
+            rtstruct_path = root / EXPECTED_FILES["combined_rtstruct"]
+            dataset = pydicom.dcmread(rtstruct_path)
+            dataset.StructureSetLabel = "RTSTRUCT"
+            pydicom.dcmwrite(rtstruct_path, dataset, enforce_file_format=True)
+
+            self.assertFalse(is_current_combined_rtstruct(rtstruct_path))
+            status = inspect_case(root, patient_id="TEST")
+            self.assertEqual(status.status, Status.FAIL_RTSTRUCT)
 
     def test_missing_sr_is_reporting_failure(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

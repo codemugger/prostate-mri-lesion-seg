@@ -51,6 +51,73 @@ from pathlib import Path
 from typing import Optional
 
 
+CANONICAL_RTSTRUCT_LABEL = "AI_PROSTATE"
+
+
+def is_current_combined_rtstruct(path: "os.PathLike[str] | str") -> bool:
+    """Return whether *path* has the accepted canonical RTSTRUCT profile.
+
+    Resume must not accept an older file merely because it has the current
+    filename. The canonical profile is flat and deterministic: prostate ROI 1,
+    lesion ROIs 2..N, matching references in all three ROI sequences,
+    ``CLOSED_PLANAR`` geometry, and truthful automatic/unapproved metadata.
+    """
+    try:
+        import pydicom
+        from pydicom.uid import ExplicitVRLittleEndian, RTStructureSetStorage
+
+        dataset = pydicom.dcmread(path, stop_before_pixels=True)
+        if str(dataset.SOPClassUID) != str(RTStructureSetStorage):
+            return False
+        if str(dataset.file_meta.TransferSyntaxUID) != str(ExplicitVRLittleEndian):
+            return False
+        if str(getattr(dataset, "StructureSetLabel", "")) != CANONICAL_RTSTRUCT_LABEL:
+            return False
+        if str(getattr(dataset, "ApprovalStatus", "")) != "UNAPPROVED":
+            return False
+
+        rois = list(getattr(dataset, "StructureSetROISequence", []))
+        contours = list(getattr(dataset, "ROIContourSequence", []))
+        observations = list(getattr(dataset, "RTROIObservationsSequence", []))
+        expected = list(range(1, len(rois) + 1))
+        if not rois or [int(item.ROINumber) for item in rois] != expected:
+            return False
+        if [int(item.ReferencedROINumber) for item in contours] != expected:
+            return False
+        if [int(item.ReferencedROINumber) for item in observations] != expected:
+            return False
+        if any(not list(getattr(item, "ContourSequence", [])) for item in contours):
+            return False
+        if str(rois[0].ROIName) != "Prostate":
+            return False
+        if any(
+            str(item.ROIName).split(" - ", 1)[0] != f"Lesion {index}"
+            for index, item in enumerate(rois[1:], start=1)
+        ):
+            return False
+        if any(
+            str(getattr(item, "ROIGenerationAlgorithm", "")) != "AUTOMATIC"
+            for item in rois
+        ):
+            return False
+        if str(observations[0].RTROIInterpretedType) != "ORGAN":
+            return False
+        if any(
+            str(item.RTROIInterpretedType) != "GTV"
+            for item in observations[1:]
+        ):
+            return False
+        if any(
+            str(contour.ContourGeometricType) != "CLOSED_PLANAR"
+            for roi in contours
+            for contour in getattr(roi, "ContourSequence", [])
+        ):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 # --------------------------------------------------------------------- #
 # File layout expected by a successful case.
 # Update here if the pipeline ever changes where it writes outputs.
@@ -210,10 +277,10 @@ def inspect_case(
 ) -> CaseStatus:
     """Inspect a case's output directory and return a :class:`CaseStatus`.
 
-    Status is decided by file presence, *not* by exit code (since the app
-    regularly exits 0 even when the pipeline produced nothing). The exit
-    code only overrides to ``FAIL_RUNTIME`` when non-zero and we did not
-    skip the case via resume.
+    Status is decided by required artifacts plus the canonical combined
+    RTSTRUCT profile, *not* by exit code alone (since the app can exit 0 even
+    when the pipeline produced nothing). The exit code only overrides to
+    ``FAIL_RUNTIME`` when non-zero and we did not skip the case via resume.
     """
     case_output_dir = Path(case_output_dir)
     pid = patient_id or case_output_dir.name
@@ -222,6 +289,10 @@ def inspect_case(
         key: (case_output_dir / rel).is_file()
         for key, rel in EXPECTED_FILES.items()
     }
+    if flags["combined_rtstruct"]:
+        flags["combined_rtstruct"] = is_current_combined_rtstruct(
+            case_output_dir / EXPECTED_FILES["combined_rtstruct"]
+        )
     flags["lesion_folds"] = all(
         (case_output_dir / rel).is_file() for rel in LESION_FOLD_FILES
     )
@@ -318,7 +389,7 @@ def _classify_from_files(
     missing_mods: "list[str]",
     file_count: int,
 ) -> "tuple[str, str]":
-    """Classify outcome based solely on file presence."""
+    """Classify outcome from required artifacts and validated profile flags."""
     if file_count == 0:
         return (
             Status.FAIL_EMPTY_OUTPUT,
@@ -378,7 +449,7 @@ def _classify_from_files(
     if missing_rtstructs:
         return (
             Status.FAIL_RTSTRUCT,
-            "Missing expected RTSTRUCT output(s): "
+            "Missing or incompatible expected RTSTRUCT output(s): "
             + ", ".join(missing_rtstructs),
         )
 
@@ -504,6 +575,12 @@ def _cli(argv: "Optional[list[str]]" = None) -> int:
     )
     summary_parser.add_argument("csv_path", type=Path)
 
+    check_parser = sub.add_parser(
+        "check-rtstruct",
+        help="Return success only for the accepted canonical combined RTSTRUCT.",
+    )
+    check_parser.add_argument("rtstruct_path", type=Path)
+
     args = parser.parse_args(argv)
 
     if args.cmd == "summary":
@@ -514,6 +591,9 @@ def _cli(argv: "Optional[list[str]]" = None) -> int:
         for status in sorted(counts):
             print(f"  {status:<24} {counts[status]:>5}")
         return 0
+
+    if args.cmd == "check-rtstruct":
+        return 0 if is_current_combined_rtstruct(args.rtstruct_path) else 1
 
     # Default path: log one case.
     if not (args.case_output_dir and args.patient_id and args.csv):

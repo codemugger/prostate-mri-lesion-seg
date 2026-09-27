@@ -32,6 +32,11 @@ from rtstruct_utils import (  # noqa: E402
     _match_mask_to_dicom_slices,
     _prepare_mask_from_array,
 )
+from urofusion_rtstruct import (  # noqa: E402
+    _parse_lesion_scores,
+    build_lesion_rois,
+    build_single_outer_prostate_profile,
+)
 
 
 CSV_COLUMNS = [
@@ -39,7 +44,7 @@ CSV_COLUMNS = [
     "valid",
     "rtstruct_count",
     "contour_count",
-    "all_closedplanar_xor",
+    "all_expected_contour_geometry",
     "minimum_contour_points",
     "degenerate_contour_count",
     "roundtrip_exact",
@@ -151,6 +156,36 @@ def validate_case(case_directory: Path) -> dict[str, str]:
             ).get_fdata()
         )
         lesion_mask = _prepared_mask(lesion_data > 0, slice_count)
+        lesion_image = nib.load(
+            str(case_directory / "lesion" / "lesion_mask.nii.gz")
+        )
+        cleaned_image = nib.load(
+            str(case_directory / "organ" / "cleaned_organ.nii.gz")
+        )
+        native_lesion = np.asarray(lesion_image.dataobj) > 0
+        native_cleaned = np.asarray(cleaned_image.dataobj) > 0
+        prostate_profile = build_single_outer_prostate_profile(
+            native_cleaned,
+            native_lesion,
+            cleaned_image.affine,
+        )
+        if not prostate_profile.accepted:
+            raise ValueError(
+                "Canonical prostate profile fails: "
+                + ";".join(prostate_profile.failed_gates)
+            )
+        lesion_rois, _ = build_lesion_rois(
+            native_lesion,
+            lesion_image.affine,
+            _parse_lesion_scores(case_directory / "lesions.txt"),
+        )
+        canonical_rois = {
+            "Prostate": np.transpose(prostate_profile.mask, (1, 0, 2)),
+            **{
+                lesion.name: np.transpose(lesion.mask, (1, 0, 2))
+                for lesion in lesion_rois
+            },
+        }
         original_organ = _organ_rois(
             case_directory / "organ" / "organ.nii.gz",
             slice_count,
@@ -164,23 +199,24 @@ def validate_case(case_directory: Path) -> dict[str, str]:
             (
                 case_directory / "organ" / "organ_RTSTRUCT.dcm",
                 original_organ,
+                "CLOSEDPLANAR_XOR",
             ),
             (
                 case_directory
                 / "organ"
                 / "cleaned_organ_RTSTRUCT.dcm",
                 cleaned_organ,
+                "CLOSEDPLANAR_XOR",
             ),
             (
                 case_directory / "lesion" / "lesion_RTSTRUCT.dcm",
                 {"Lesion": lesion_mask},
+                "CLOSEDPLANAR_XOR",
             ),
             (
                 case_directory / "combined_organ_lesion_RTSTRUCT.dcm",
-                {
-                    **cleaned_organ,
-                    **({"Lesion": lesion_mask} if lesion_mask.any() else {}),
-                },
+                canonical_rois,
+                "CLOSED_PLANAR",
             ),
         ]
 
@@ -188,13 +224,13 @@ def validate_case(case_directory: Path) -> dict[str, str]:
         minimum_points: int | None = None
         degenerate_count = 0
         different_voxels = 0
-        all_xor = True
+        all_expected_geometry = True
         studies_match = True
         full_t2_reference = True
         contour_references_t2 = True
         invalid_short_strings = 0
 
-        for rtstruct_path, expected_rois in rtstruct_specs:
+        for rtstruct_path, expected_rois, expected_geometry in rtstruct_specs:
             if not rtstruct_path.is_file():
                 errors.append(f"missing:{rtstruct_path.name}")
                 continue
@@ -221,9 +257,8 @@ def validate_case(case_directory: Path) -> dict[str, str]:
                     [],
                 ):
                     contour_count += 1
-                    all_xor &= (
-                        str(contour.ContourGeometricType)
-                        == "CLOSEDPLANAR_XOR"
+                    all_expected_geometry &= (
+                        str(contour.ContourGeometricType) == expected_geometry
                     )
                     points = np.asarray(
                         contour.ContourData,
@@ -270,8 +305,8 @@ def validate_case(case_directory: Path) -> dict[str, str]:
                     np.logical_xor(actual_mask, expected_mask).sum()
                 )
 
-        if not all_xor:
-            errors.append("non_xor_contour")
+        if not all_expected_geometry:
+            errors.append("unexpected_contour_geometry")
         if degenerate_count:
             errors.append("degenerate_contour")
         if different_voxels:
@@ -289,10 +324,12 @@ def validate_case(case_directory: Path) -> dict[str, str]:
             "patient_id": case_directory.name,
             "valid": str(not errors).lower(),
             "rtstruct_count": str(
-                sum(path.is_file() for path, _ in rtstruct_specs)
+                sum(path.is_file() for path, _, _ in rtstruct_specs)
             ),
             "contour_count": str(contour_count),
-            "all_closedplanar_xor": str(all_xor).lower(),
+            "all_expected_contour_geometry": str(
+                all_expected_geometry
+            ).lower(),
             "minimum_contour_points": str(minimum_points or 0),
             "degenerate_contour_count": str(degenerate_count),
             "roundtrip_exact": str(different_voxels == 0).lower(),

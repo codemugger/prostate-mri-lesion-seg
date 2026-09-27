@@ -86,6 +86,7 @@ from common import crop_pos_classification_multi_channel_3d
 from common import compute_prostate_measurements
 from dicom_sr_utils import generate_prostate_measurement_sr
 from rtstruct_utils import find_dicom_series_by_uid
+from urofusion_rtstruct import generate_accepted_rtstruct
 
 ###############################################################################
 class ProstateLesionClassifierOperator(Operator):
@@ -312,6 +313,31 @@ class ProstateLesionClassifierOperator(Operator):
                 "Failed to generate prostate measurement DICOM SR: %s",
                 exc,
             )
+
+        # Publish the radiologist- and vendor-accepted UroFusion profile as the
+        # canonical combined RTSTRUCT. Remove any pre-existing same-name file
+        # before this required conversion. A failure must remain visible as a
+        # missing required output rather than allowing resume/audit to accept
+        # a stale legacy RTSTRUCT.
+        combined_rtstruct_path = (
+            self.output_folder / "combined_organ_lesion_RTSTRUCT.dcm"
+        )
+        if combined_rtstruct_path.exists():
+            combined_rtstruct_path.unlink()
+        try:
+            rtstruct_result = generate_accepted_rtstruct(self.output_folder)
+            self.logger.info(
+                "Canonical UroFusion-compatible RTSTRUCT created with %d contours",
+                rtstruct_result["contour_count"],
+            )
+        except Exception as exc:
+            self.logger.exception(
+                "Required canonical UroFusion-compatible RTSTRUCT generation failed: %s",
+                exc,
+            )
+            raise RuntimeError(
+                "Canonical UroFusion-compatible RTSTRUCT generation failed"
+            ) from exc
 
         # Now emit data to the output ports of this operator
         op_output.emit(self.output_folder, self.output_name_saved_images_folder)

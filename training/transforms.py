@@ -18,6 +18,8 @@ from monai.transforms import (
     RandCropByPosNegLabeld,
     RandFlipd,
     RandGaussianNoised,
+    ResampleToMatchd,
+    ResizeWithPadOrCropd,
     Spacingd,
     SpatialPadd,
 )
@@ -39,9 +41,18 @@ def get_organ_train_transforms(
             EnsureChannelFirstd(keys=["image", "label"]),
             Orientationd(keys=["image", "label"], axcodes="RAS"),
             Spacingd(
-                keys=["image", "label"],
+                keys=["image"],
                 pixdim=tuple(spacing),
-                mode=("bilinear", "nearest"),
+                mode="bilinear",
+            ),
+            # The supervision must use the exact image grid. Independent
+            # Spacingd calls can differ by one voxel or a sub-voxel origin
+            # when source image/label grids have different extents.
+            ResampleToMatchd(
+                keys=["label"],
+                key_dst="image",
+                mode="nearest",
+                padding_mode="zeros",
             ),
             NormalizeIntensityd(
                 keys=["image"], nonzero=True, channel_wise=True
@@ -59,11 +70,20 @@ def get_organ_train_transforms(
             RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
             RandAffined(
                 keys=["image", "label"],
+                spatial_size=tuple(roi_size),
                 prob=0.2,
                 rotate_range=(0.05, 0.05, 0.03),
                 scale_range=(0.05, 0.05, 0.05),
                 mode=("bilinear", "nearest"),
                 padding_mode="border",
+            ),
+            # MONAI 1.4 can occasionally return an affine result one voxel
+            # short because of physical-grid rounding. Enforce the model's
+            # exact, divisible-by-16 patch contract before batch collation.
+            ResizeWithPadOrCropd(
+                keys=["image", "label"],
+                spatial_size=tuple(roi_size),
+                mode="constant",
             ),
             RandGaussianNoised(keys=["image"], prob=0.15, std=0.05),
             EnsureTyped(keys=["image", "label"], dtype=(np.float32, np.int64)),
@@ -79,9 +99,15 @@ def get_organ_val_transforms(spacing: Sequence[float]) -> Compose:
             EnsureChannelFirstd(keys=["image", "label"]),
             Orientationd(keys=["image", "label"], axcodes="RAS"),
             Spacingd(
-                keys=["image", "label"],
+                keys=["image"],
                 pixdim=tuple(spacing),
-                mode=("bilinear", "nearest"),
+                mode="bilinear",
+            ),
+            ResampleToMatchd(
+                keys=["label"],
+                key_dst="image",
+                mode="nearest",
+                padding_mode="zeros",
             ),
             NormalizeIntensityd(
                 keys=["image"], nonzero=True, channel_wise=True

@@ -20,7 +20,7 @@ output_beta/
 /interesting_outputs_follow_up
 /[Oo][Uu][Tt][Pp][Uu][Tt][Ss]*[A-Za-z0-9_/-]*[Oo][Uu][Tt][Pp][Uu][Tt][Ss]*
 28_july_outputs_follow_up_for_anh
-
+Dr Anh's 11 August feedback.docx
 # Windows / macOS metadata files (often appear after copying/unzipping datasets)
 .Identifier
 *.Identifier
@@ -67,3 +67,4 @@ Dr Anh's gemini ai prompt to investigate and consider implementing if feasible.p
 .gitignore
 Dr Anh's request for help July 2026.docx
 audit_assignments.csv
+august_rtstruct_follow_up_for_anh

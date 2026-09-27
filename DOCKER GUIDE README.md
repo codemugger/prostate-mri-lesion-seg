@@ -252,7 +252,7 @@ writes an audit CSV (one row per case):
 | `has_merged_lesion_prob`, `has_lesion_folds` | Real lesion inference (vs empty-mask fallback) |
 | `has_lesions_txt` | Classifier (PI-RADS) report |
 | `has_prostate_sr` | DICOM prostate measurement Structured Report |
-| `has_combined_rtstruct` | Combined cleaned-organ + lesion RTSTRUCT |
+| `has_combined_rtstruct` | Accepted canonical combined RTSTRUCT; false for missing or legacy/incompatible profiles |
 | `organ_cleanup_status` | `UNCHANGED`, `CLEANED`, `EMPTY`, or `INVALID` |
 | `organ_island_count_before`, `organ_removed_island_count`, `organ_removed_voxels`, `organ_filled_hole_voxels`, `organ_largest_component_fraction` | Organ cleanup metrics |
 | `output_file_count` | Total files under the case output dir |
@@ -270,7 +270,7 @@ writes an audit CSV (one row per case):
 | `FAIL_LESION_SEG` | Organ present but `lesion_mask.nii.gz` missing. | Lesion seg operator failure. |
 | `FAIL_CLASSIFIER` | Lesion mask present but `lesions.txt` missing. | Classifier operator failure. |
 | `FAIL_REPORTING` | `lesions.txt` exists but the DICOM SR is missing. | Check malformed/missing source DICOM and SR logs. |
-| `FAIL_RTSTRUCT` | One or more required RTSTRUCT files are missing. | Check RTSTRUCT generation logs. |
+| `FAIL_RTSTRUCT` | A required RTSTRUCT is missing or the combined file does not match the accepted canonical profile. | Check RTSTRUCT generation/profile validation logs. |
 | `FAIL_RUNTIME` | Container exited with non-zero code. | Check stderr; may be partial. |
 | `FAIL_EMPTY_OUTPUT` | Exit 0 but no output files at all. | Every selector rejected the input. |
 | `SKIPPED_RESUME` | Resume mode: existing complete output re-used, not re-run. | — |
@@ -343,12 +343,11 @@ output/
 └── combined_organ_lesion_RTSTRUCT.dcm  # Combined organ + lesion RT Structure Set
 ```
 
-All four RTSTRUCT files use separate DICOM `CLOSEDPLANAR_XOR` contours.
-Pinhole/keyhole encoding is disabled because its artificial connector channels
-appear as lines through an ROI in viewers such as CARPL. Contour approximation
-is also disabled, and tiny point/line components are converted to valid
-pixel-footprint polygons so rasterizing the RTSTRUCT reproduces the NIfTI mask
-exactly.
+The three supporting organ/lesion RTSTRUCT files retain separate DICOM
+`CLOSEDPLANAR_XOR` contours. The canonical combined file uses the accepted
+UroFusion `CLOSED_PLANAR` profile: prostate ROI 1, lesions ROI 2…N, one outer
+prostate contour per occupied T2 slice, and no prostate smoothing. Pinhole and
+keyhole encoding remain disabled.
 
 The SR is a DICOM Comprehensive SR referencing the selected T2 study. It
 contains cleaned-prostate LR/AP/SI dimensions (mm) and volume (mm³ and cm³),
@@ -390,11 +389,11 @@ full inference results live in the folder shown in the HIVE screenshot. Paths
 with spaces must remain quoted.
 
 ```bash
-HIVE_RUN="$HOME/Documents/Prostate HIVE Inference 4 Jun 2026 - highb fix"
+HIVE_RUN="/home/ddsadmin/Documents/Prostate HIVE Inference 4 jun 2026 - highb fix"
 
-docker run --rm --gpus device=0 --shm-size=16g \
+docker run --rm --shm-size=16g \
   -v "$PWD":/workspace \
-  -v "$HIVE_RUN/Interesting outputs":/hive-output:ro \
+  -v "$HIVE_RUN/output":/hive-output:ro \
   -w /workspace \
   prostate-mri-training:latest \
   python scripts/prepare_training_data.py \
@@ -413,12 +412,14 @@ Train the single organ model:
 
 ```bash
 docker run --rm --gpus device=0 --shm-size=16g \
+  -e CUDA_VISIBLE_DEVICES=0 -e HIVE_REQUIRE_SINGLE_GPU=1 \
   -v "$PWD":/workspace \
-  -v "$HIVE_RUN/Interesting outputs":/hive-output:ro \
+  -v "$HIVE_RUN/output":/hive-output:ro \
+  -v "$HIVE_RUN/models":/pretrained-models:ro \
   -w /workspace \
   prostate-mri-training:latest \
   python -m training.train_organ --config configs/organ.yaml \
-    --initial-weights models/organ/model.ts
+    --initial-weights /pretrained-models/organ/model.ts
 ```
 
 Train one lesion fold per job. Repeat with `FOLD=0` through `FOLD=4`; jobs may
@@ -427,17 +428,24 @@ be assigned to different GPUs, but each container is restricted to one GPU.
 ```bash
 FOLD=0
 docker run --rm --gpus device=0 --shm-size=16g \
+  -e CUDA_VISIBLE_DEVICES=0 -e HIVE_REQUIRE_SINGLE_GPU=1 \
   -v "$PWD":/workspace \
-  -v "$HIVE_RUN/Interesting outputs":/hive-output:ro \
+  -v "$HIVE_RUN/output":/hive-output:ro \
+  -v "$HIVE_RUN/models":/pretrained-models:ro \
   -w /workspace \
   prostate-mri-training:latest \
   python -m training.train_lesion --config configs/lesion.yaml --fold "$FOLD" \
-    --initial-weights "models/fold${FOLD}/model_best_fold${FOLD}.pth.tar"
+    --initial-weights "/pretrained-models/fold${FOLD}/model_best_fold${FOLD}.pth.tar"
 ```
 
 Checkpoints contain optimizer, scheduler, AMP-scaler, epoch, best metric, and
 resolved config. Resume a stopped job with `--resume <model_last...pth.tar>`;
 do not also pass `--initial-weights`.
+
+For the current HIVE paths, prefer `hive_train_organ.ipynb` and
+`hive_train_lesion.ipynb`. Their shared helper runs the same commands, checks
+that PyTorch sees exactly one GPU, prevents organ/lesion jobs from overlapping,
+and retains permanent epoch-50 snapshots (plus epochs 100/150/200 for organ).
 
 TensorBoard is written beneath each run directory. Serve it from a short-lived
 container:

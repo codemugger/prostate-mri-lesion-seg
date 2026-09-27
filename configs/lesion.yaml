@@ -32,14 +32,17 @@ model:
   se: false
 
 train:
-  epochs: 60
+  # Conservative transfer-learning schedule used by the completed HIVE folds.
+  epochs: 50
   batch_size: 1
-  lr: 0.0003
+  lr: 0.0001
   weight_decay: 0.0001
   amp: true
   seed: 42
-  grad_accum_steps: 1
+  # Effective batch size 2 without increasing peak GPU memory.
+  grad_accum_steps: 2
   log_interval: 20
+  # Select the best checkpoint on every epoch for this 50-epoch run.
   val_interval: 1
 
 # RRUNet already applies Softmax, so this loss consumes probabilities directly.
@@ -54,7 +57,8 @@ optimizer:
 
 scheduler:
   type: cosine_anneal
-  t_max: 60
+  # One monotonic 50-epoch cosine decay; no restarts/cycles.
+  t_max: 50
   eta_min: 1.0e-6
 
 validation:
@@ -66,3 +70,5 @@ validation:
 output:
   exp_dir: experiments/lesion
   save_last_interval: 1
+  # Retain a full inference-compatible/resumable checkpoint every 10 epochs.
+  snapshot_interval: 10

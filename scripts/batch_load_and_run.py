@@ -35,6 +35,7 @@ from case_status import (  # noqa: E402
     append_csv_row,
     already_logged,
     inspect_case,
+    is_current_combined_rtstruct,
     summarise,
 )
 
@@ -124,8 +125,14 @@ def _count_output_files(directory: Path) -> int:
 
 def _is_current_output_complete(directory: Path) -> bool:
     """Return whether a case has every required current-format artifact."""
-    return all((directory / relative_path).is_file()
-               for relative_path in CURRENT_REQUIRED_OUTPUTS)
+    if not all(
+        (directory / relative_path).is_file()
+        for relative_path in CURRENT_REQUIRED_OUTPUTS
+    ):
+        return False
+    return is_current_combined_rtstruct(
+        directory / "combined_organ_lesion_RTSTRUCT.dcm"
+    )
 
 
 def _acquire_batch_lock(output_root: Path):
