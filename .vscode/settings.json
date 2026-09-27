@@ -1,4 +1,6 @@
 {
     "chatgpt.openOnStartup": true,
-    "python.formatting.provider": "black"
+    "python.formatting.provider": "black",
+    "chatgpt.runCodexInWindowsSubsystemForLinux": true,
+    "python.defaultInterpreterPath": "/home/anson/.pyenv/versions/3.11.11/bin/python3"
 }
