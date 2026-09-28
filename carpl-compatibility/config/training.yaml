@@ -1,0 +1,36 @@
+# input paths
+image_dir: "data/training/images/"
+tabular_train_path: "data/training/tabular_data_train.csv"
+tabular_val_path: "data/training/tabular_data_val.csv"
+
+# output paths
+run_name: "training_testrun"
+output_dir: "outputs/train/"
+
+# seed
+seed: 42
+
+# preprocessing configuration
+img_size: [512, 512]
+age_bins: [0, 64, 72, 79.8] # np.inf appended in code
+
+# classifier configuration
+tabular_dim: 2
+tabular_proj: 512
+hidden_dim: 256
+dropout: 0.3
+
+# training configuration
+batch_size: 16
+base_lr: 0.001
+lr_scheduler: "cosineannealing" # options: "cosineannealing"
+warmup_epochs: 5 # for lr scheduler
+layer_decay: 0.75
+weight_decay: 0.01
+frozen_epochs: 5 # for freezing the image encoder
+total_epochs: 300
+patience: 5
+improvement_delta: 0.001
+
+# tracking configuration
+checkpoint_freq: 10

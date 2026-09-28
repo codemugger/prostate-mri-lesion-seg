@@ -1,0 +1,10 @@
+# Input: evaluation results used to fit the calibrator.
+# These should come from a held-out evaluation run, not the training set.
+results_csv: "outputs/evaluation/evaluation_testrun/evaluation_results.csv"
+
+# Output: fitted calibrator saved here and loaded by inference / evaluation.
+calibrator_output_path: "components/isotonic_calibrator.pkl"
+
+# Run metadata
+run_name: "calibration"
+output_dir: "outputs/calibration/"

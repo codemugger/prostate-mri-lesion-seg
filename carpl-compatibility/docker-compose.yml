@@ -1,0 +1,108 @@
+version: '3.9'
+
+services:
+
+  dicom-listener:
+    build:
+      context: ./dicom-listener
+    image: dicom-listener
+    container_name: dicom-listener
+
+    ports:
+      - "11112:11112"
+
+    environment:
+      DICOM_AE: AI_ENGINE        # AE title CARPL uses to push studies to us
+      DICOM_PORT: 11112
+      STORAGE_DIR: /data/incoming
+      OUTPUT_DIR: /data/output
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+    volumes:
+      - ./data/incoming:/data/incoming
+      - ./data/output:/data/output
+
+    depends_on:
+      - redis
+
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+
+    ports:
+      - "6379:6379"
+
+
+  ai-worker:
+    build:
+      context: .
+      dockerfile: ai-worker/Dockerfile
+    image: ai-worker
+    container_name: ai-worker
+
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+      INPUT_DIR: /data/incoming
+      OUTPUT_DIR: /data/output
+
+    volumes:
+      - ./data/incoming:/data/incoming
+      - ./data/output:/data/output
+
+    depends_on:
+      - redis
+      - dicom-listener
+
+
+  dicom-sender:
+    build:
+      context: ./dicom-sender
+    image: dicom-sender
+    container_name: dicom-sender
+
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+      # Toggle: "local"      → C-STOREs to the carpl-receiver stub (data/test_carpl/)
+      #         "production" → C-STOREs to the real CARPL server (DEST_* vars below)
+      SENDER_MODE: local
+
+      MY_AE: AI_ENGINE
+      DEST_AE: CARPL_DICOM       # production CARPL DICOM AE title
+      DEST_HOST: 10.10.30.50     # production CARPL DICOM receiver IP
+      DEST_PORT: 11112           # production CARPL DICOM receiver port
+
+    volumes:
+      - ./data/output:/data/output
+      - ./data/test_carpl:/data/test_carpl
+
+    depends_on:
+      - redis
+      - ai-worker
+      - carpl-receiver
+
+
+  # Local CARPL stub — only needed if you set SENDER_MODE=local and want to
+  # test C-STORE delivery locally instead of writing to local_output.
+  # Not used when SENDER_MODE=local (disk write) or SENDER_MODE=production.
+  carpl-receiver:
+    build:
+      context: ./carpl-receiver
+    image: carpl-receiver
+    container_name: carpl-receiver
+
+    environment:
+      DICOM_AE: CARPL_DICOM
+      DICOM_PORT: 11113
+      STORAGE_DIR: /data/test_carpl
+
+    ports:
+      - "11113:11113"
+
+    volumes:
+      - ./data/test_carpl:/data/test_carpl

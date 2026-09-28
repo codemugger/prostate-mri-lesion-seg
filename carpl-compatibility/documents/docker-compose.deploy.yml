@@ -1,0 +1,93 @@
+version: '3.9'
+
+services:
+
+  dicom-listener:
+    image: dicom-listener:latest
+    container_name: cxrbmd-dicom-listener
+    restart: unless-stopped
+
+    environment:
+      DICOM_AE: AI_ENGINE        # AE title CARPL uses to push studies to us
+      DICOM_PORT: 11112
+      STORAGE_DIR: /data/incoming
+      OUTPUT_DIR: /data/output
+      REDIS_HOST: cxrbmd-redis
+      REDIS_PORT: 6379
+
+    volumes:
+      - ./data/incoming:/data/incoming
+      - ./data/output:/data/output
+
+    depends_on:
+      - redis
+
+    networks:
+      - rapier_backend
+
+
+  redis:
+    image: redis:7-alpine
+    container_name: cxrbmd-redis
+    restart: unless-stopped
+
+    networks:
+      - rapier_backend
+
+
+  ai-worker:
+    image: ai-worker:latest
+    container_name: cxrbmd-ai-worker
+    restart: unless-stopped
+
+    environment:
+      REDIS_HOST: cxrbmd-redis
+      REDIS_PORT: 6379
+
+      INPUT_DIR: /data/incoming
+      OUTPUT_DIR: /data/output
+
+    volumes:
+      - ./data/incoming:/data/incoming
+      - ./data/output:/data/output
+
+    depends_on:
+      - redis
+      - dicom-listener
+
+    networks:
+      - rapier_backend
+
+
+  dicom-sender:
+    image: dicom-sender:latest
+    container_name: cxrbmd-dicom-sender
+    restart: unless-stopped
+
+    environment:
+      REDIS_HOST: cxrbmd-redis
+      REDIS_PORT: 6379
+
+      SENDER_MODE: production
+
+      MY_AE: AI_ENGINE
+      # Send AI results to orthanc-prefect (Prefect inference receive)
+      DEST_AE: CARPL-RECIEVE
+      DEST_HOST: rapier-orthanc-prefect
+      DEST_PORT: 4242
+
+    volumes:
+      - ./data/output:/data/output
+
+    depends_on:
+      - redis
+      - ai-worker
+
+    networks:
+      - rapier_backend
+
+
+networks:
+  rapier_backend:
+    external: true
+    name: rapier-carpl_docker_backend
