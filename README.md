@@ -274,6 +274,24 @@ INPUT_DIR=/data/patient01 OUTPUT_DIR=/output/patient01 MODEL_DIR=/models \
 
 The Docker image uses NVIDIA CUDA 12.4 + cuDNN runtime (Ubuntu 22.04, Python 3.10) with PyTorch 2.6.0 (CUDA 12.4).
 
+### CARPL (DICOM Push integration)
+
+`carpl/` packages the same inference image as a CARPL DICOM Push algorithm. It
+follows the CXR-BMD stack already running on the SGH RAPIER host: a DICOM
+listener, a Redis queue, a GPU worker and a DICOM sender. CARPL C-STOREs an MR
+study to the listener, which dispatches it only once the whole study has
+arrived. The worker runs this unchanged app. The sender then returns
+`combined_organ_lesion_RTSTRUCT.dcm` and `prostate_measurements_SR.dcm` to
+CARPL unmodified.
+
+```bash
+python scripts/build_carpl_images.py --version 1.0.0 --build-base
+# -> dist/prostate-carpl-1.0.0/ (images.tar, docker-compose-carpl.yml, .env.example, README.md)
+```
+
+See [`carpl/README.md`](carpl/README.md) for deployment, registration, local
+end-to-end testing, parity checks and operations.
+
 ### Batch processing (local, non-Docker)
 
 ```bash
@@ -504,6 +522,7 @@ This calls `scripts/eval_dice.py` under the hood (loads two NIfTI files, compute
 - DICOM SR export: `prostate_mri_lesion_seg_app/dicom_sr_utils.py`
 - Training: `training/engine.py`, `training/train_organ.py`, `training/train_lesion.py`
 - Docker: `docker/Dockerfile`, `docker/docker-compose.yaml`, `docker/requirements.txt`
+- CARPL integration: `carpl/` (listener, worker, sender, compose files; see `carpl/README.md`)
 - Scripts: see [Scripts](#scripts) section below
 
 
@@ -543,6 +562,7 @@ There are several scripts to help with running, validation, deployment, and deve
 ### Docker build
 
 - `scripts/build_and_save.py`: Build the `prostate-mri-seg` Docker image from `docker/Dockerfile` and save it as `docker/docker_image.tar` for transfer to HIVE or air-gapped machines.
+- `scripts/build_carpl_images.py`: Build the CARPL images on top of the inference image. It checks that inference layers and dependencies are identical, runs the CARPL tests, and writes the RAPIER deploy bundle to `dist/prostate-carpl-<version>/`.
 
 ### Evaluation and validation
 

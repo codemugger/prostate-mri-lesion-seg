@@ -68,3 +68,12 @@ Dr Anh's gemini ai prompt to investigate and consider implementing if feasible.p
 Dr Anh's request for help July 2026.docx
 audit_assignments.csv
 august_rtstruct_follow_up_for_anh
+
+# CARPL deployment runtime state (patient DICOM, jobs, audit), local config
+# and build outputs
+/carpl/data/
+/carpl/models/
+/carpl/config/
+/carpl/.env
+/carpl/.venv/
+/dist/

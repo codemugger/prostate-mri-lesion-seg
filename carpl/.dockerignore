@@ -1,0 +1,11 @@
+# Build context for the listener / sender / receiver images is carpl/.
+# Never send runtime data (patient DICOM, jobs, audit), models or local
+# configuration to the Docker daemon.
+data/
+models/
+config/
+dist/
+.env
+**/__pycache__/
+**/*.pyc
+.venv/

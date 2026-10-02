@@ -1,0 +1,105 @@
+# Prostate MRI lesion segmentation - CARPL production stack (SGH RAPIER host)
+#
+# Mirrors the CXR-BMD CARPL deployment: pre-loaded images (docker load),
+# no published host ports, and the listener/sender joined to CARPL's
+# external Docker network so CARPL reaches the listener by container name
+# and results go to CARPL-RECIEVE@rapier-orthanc-prefect:4242.
+#
+# Directory layout next to this file (see carpl/README.md):
+#   .env                       copied from .env.example
+#   data/                      runtime state (patient DICOM, jobs, audit, redis)
+#   models/                    exactly the 7 model files (read-only)
+#   config/                    optional deployment_manifest.json (read-only)
+#
+#   docker compose -f docker-compose-carpl.yml up -d
+
+name: prostate-mri-carpl
+
+x-service: &service
+  restart: unless-stopped
+  user: "${PUID:-1000}:${PGID:-1000}"
+  env_file: [.env]
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+services:
+  prostate-redis:
+    <<: *service
+    image: redis:7.4-alpine
+    container_name: prostate-redis
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec",
+              "--maxmemory-policy", "noeviction", "--save", ""]
+    volumes:
+      - ./data/redis:/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prostate-dicom-listener:
+    <<: *service
+    image: prostate-carpl-dicom-listener:${VERSION:?set VERSION in .env}
+    container_name: prostate-dicom-listener
+    environment:
+      REDIS_HOST: prostate-redis
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data
+    networks: [internal, rapier_backend]
+    depends_on:
+      prostate-redis:
+        condition: service_healthy
+
+  prostate-ai-worker:
+    <<: *service
+    image: prostate-carpl-ai-worker:${VERSION:?set VERSION in .env}
+    container_name: prostate-ai-worker
+    init: true
+    shm_size: "1g"
+    stop_grace_period: 120s
+    environment:
+      REDIS_HOST: prostate-redis
+      DATA_DIR: /data
+      MODELS_DIR: /models
+    volumes:
+      - ./data:/data
+      - ./models:/models:ro
+      - ./config:/config:ro
+    networks: [internal]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      prostate-redis:
+        condition: service_healthy
+
+  prostate-dicom-sender:
+    <<: *service
+    image: prostate-carpl-dicom-sender:${VERSION:?set VERSION in .env}
+    container_name: prostate-dicom-sender
+    environment:
+      REDIS_HOST: prostate-redis
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data
+    networks: [internal, rapier_backend]
+    depends_on:
+      prostate-redis:
+        condition: service_healthy
+
+networks:
+  # Redis and the worker are reachable only inside this stack.
+  internal:
+    internal: true
+  rapier_backend:
+    external: true
+    name: rapier-carpl_docker_backend

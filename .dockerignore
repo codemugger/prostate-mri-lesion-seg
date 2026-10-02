@@ -34,3 +34,33 @@ __pycache__/
 
 # ---- Docker build artefacts ----
 docker/docker_image.tar
+
+# ---- Additional local artefacts (keep the build context small) ----
+# Patterns without "**/" only match at the context root, so nested files
+# such as docker/requirements.txt are unaffected.
+docker/*.tar
+output*
+dist/
+models_backup/
+annotations/
+rsna claims/
+28_july_outputs_follow_up_for_anh/
+august_rtstruct_follow_up_for_anh/
+Interesting outputs/
+interesting_outputs_follow_up/
+updated output to try in carpl viewer - 29 apr 2026/
+*.xlsx
+*.csv
+*.pdf
+*.docx
+*.jpg
+*.dcm
+*.txt
+
+# ---- CARPL integration (reference copy and runtime data) ----
+carpl-compatibility/
+carpl/data/
+carpl/models/
+carpl/config/
+carpl/.env
+carpl/.venv/

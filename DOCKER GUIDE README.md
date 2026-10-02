@@ -371,6 +371,21 @@ RTSTRUCT-to-NIfTI voxel difference.
 
 ---
 
+## CARPL deployment (DICOM Push)
+
+The CARPL stack in `carpl/` reuses this inference image unchanged. Its worker
+image is built `FROM prostate-mri-seg:<version>`, and the build refuses to
+package unless every base layer and the `pip freeze` output are identical. It
+adds a DICOM listener, a Redis queue and a DICOM sender, so CARPL can push MR
+studies and receive the combined RTSTRUCT and SR back. See
+[`carpl/README.md`](carpl/README.md).
+
+```bash
+python scripts/build_carpl_images.py --version 1.0.0 --build-base
+```
+
+---
+
 ## HIVE training (separate plain-Docker image)
 
 Training uses `docker/Dockerfile.training`; the working inference image above
@@ -555,3 +570,5 @@ ENV PYTHONUNBUFFERED=1          # immediate log output
 | `scripts/load_and_run.py` | Load tar + run pipeline (single patient) |
 | `scripts/batch_load_and_run.py` | Batch processing with resume + cooldown + audit CSV |
 | `scripts/case_status.py` | Per-case status classifier + audit-CSV writer (shared by both `test_batch.sh` and `batch_load_and_run.py`) |
+| `scripts/build_carpl_images.py` | Build/verify/package the CARPL images (see `carpl/README.md`) |
+| `carpl/` | CARPL DICOM Push stack: listener, worker, sender, compose files |

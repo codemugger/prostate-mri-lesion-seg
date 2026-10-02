@@ -1,0 +1,10 @@
+# Python dependencies for the lightweight CARPL services
+# (dicom-listener, dicom-sender, carpl-receiver stub and carpl/tools).
+#
+# pydicom is pinned to the same version as the inference image
+# (docker/requirements.txt) so every container parses DICOM identically.
+# The ai-worker does NOT use this file: it inherits the unchanged inference
+# image and adds only redis-py in an isolated --target directory.
+pydicom==3.0.1
+pynetdicom==3.0.4
+redis==8.1.0

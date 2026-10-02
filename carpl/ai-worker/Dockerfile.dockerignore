@@ -1,0 +1,7 @@
+# Allowlist build context for carpl/ai-worker/Dockerfile (context = repo root).
+# BuildKit uses this file instead of the root .dockerignore for this build.
+*
+!carpl/common/carpl_common.py
+!carpl/common/healthcheck.py
+!carpl/ai-worker/worker.py
+!scripts/case_status.py

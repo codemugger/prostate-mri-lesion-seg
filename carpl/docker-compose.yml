@@ -1,0 +1,123 @@
+# Prostate MRI CARPL stack - LOCAL development / end-to-end test
+#
+# Builds the images from this repository, publishes the listener on
+# localhost:11112 and replaces CARPL with the carpl-receiver stub
+# (AE CARPL-RECIEVE on port 4242, stores to ./data/test_carpl).
+#
+# From the carpl/ folder:
+#   mkdir -p data/redis config
+#   VERSION=1.0.0 docker compose up -d --build
+#   python tools/send_study.py ../test-data/ProstateX-0004 --port 11112
+#
+# The base inference image prostate-mri-seg:${VERSION} must already exist
+# (python scripts/build_carpl_images.py --build-base --version <v>).
+
+name: prostate-mri-carpl-dev
+
+x-service: &service
+  user: "${PUID:-1000}:${PGID:-1000}"
+  environment: &env
+    REDIS_HOST: prostate-redis
+    DATA_DIR: /data
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    DICOM_AE: PROSTATE_AI
+    DICOM_PORT: "11112"
+    STUDY_QUIET_SECONDS: ${STUDY_QUIET_SECONDS:-20}
+    MIN_FREE_GB: ${MIN_FREE_GB:-5}
+    AMBIGUOUS_SELECTION_POLICY: ${AMBIGUOUS_SELECTION_POLICY:-send}
+    REQUIRE_GPU: ${REQUIRE_GPU:-true}
+    JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-900}
+    CALLING_AE: PROSTATE_AI
+    DEST_AE: CARPL-RECIEVE
+    DEST_HOST: prostate-carpl-receiver
+    DEST_PORT: "4242"
+    SEND_BACKOFF_BASE_SECONDS: ${SEND_BACKOFF_BASE_SECONDS:-5}
+    SEND_MAX_ATTEMPTS: ${SEND_MAX_ATTEMPTS:-8}
+
+services:
+  prostate-redis:
+    image: redis:7.4-alpine
+    container_name: prostate-dev-redis
+    user: "${PUID:-1000}:${PGID:-1000}"
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec",
+              "--maxmemory-policy", "noeviction", "--save", ""]
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  prostate-dicom-listener:
+    <<: *service
+    build:
+      context: .
+      dockerfile: dicom-listener/Dockerfile
+    image: prostate-carpl-dicom-listener:${VERSION:-1.0.0}
+    container_name: prostate-dev-dicom-listener
+    ports:
+      - "11112:11112"
+    volumes:
+      - ./data:/data
+    depends_on:
+      prostate-redis:
+        condition: service_healthy
+
+  prostate-ai-worker:
+    <<: *service
+    build:
+      context: ..
+      dockerfile: carpl/ai-worker/Dockerfile
+      args:
+        BASE_IMAGE: prostate-mri-seg:${VERSION:-1.0.0}
+    image: prostate-carpl-ai-worker:${VERSION:-1.0.0}
+    container_name: prostate-dev-ai-worker
+    init: true
+    shm_size: "1g"
+    stop_grace_period: 120s
+    environment:
+      <<: *env
+      MODELS_DIR: /models
+    volumes:
+      - ./data:/data
+      - ${MODEL_DIR:-../models}:/models:ro
+      - ./config:/config:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      prostate-redis:
+        condition: service_healthy
+
+  prostate-dicom-sender:
+    <<: *service
+    build:
+      context: .
+      dockerfile: dicom-sender/Dockerfile
+    image: prostate-carpl-dicom-sender:${VERSION:-1.0.0}
+    container_name: prostate-dev-dicom-sender
+    volumes:
+      - ./data:/data
+    depends_on:
+      prostate-redis:
+        condition: service_healthy
+
+  # Stand-in for CARPL's result receiver (CARPL-RECIEVE@rapier-orthanc-prefect:4242).
+  prostate-carpl-receiver:
+    user: "${PUID:-1000}:${PGID:-1000}"
+    build:
+      context: .
+      dockerfile: carpl-receiver/Dockerfile
+    image: prostate-carpl-receiver:${VERSION:-1.0.0}
+    container_name: prostate-carpl-receiver
+    environment:
+      DICOM_AE: CARPL-RECIEVE
+      DICOM_PORT: "4242"
+      STORAGE_DIR: /data/test_carpl
+    volumes:
+      - ./data:/data
