@@ -40,7 +40,7 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
   - `output/lesion/lesion_mask.nii.gz` (binary mask; no component-size filtering is applied without clinical validation)
 - Lesion report with PI‑RADS and lesion statistics
   - `output/lesions.txt` (YAML: per-lesion PI‑RADS, major axis length, volume; prostate volume in mm³/cc and LR/AP/SI dimensions in mm)
-  - `output/prostate_measurements_SR.dcm` (DICOM Comprehensive SR / TID 1500 measurement report; COMPLETE, UNVERIFIED)
+  - `output/prostate_measurements_SR.dcm` (DICOM Comprehensive SR / TID 1500 measurement report: prostate measurements plus one finding per AI lesion with PI-RADS and AI probability; COMPLETE, UNVERIFIED)
 - RTSTRUCT files (DICOM RT Structure Set), all referenced against the pipeline-selected T2 DICOM series
   - `output/organ/organ_RTSTRUCT.dcm` — original organ zones (kept for reference/review by radiologists)
   - `output/organ/cleaned_organ_RTSTRUCT.dcm` — cleaned organ zones (islands removed, clinically accurate)
@@ -167,7 +167,7 @@ This workflow takes T2, ADC, and HighB MRI series as input and produces several 
   - If predicted=2 (PI‑RADS 4) and major axis > 40 mm → promote to PI‑RADS 5.
 - Reporting:
   - `lesions.txt` includes per-lesion ID, major axis length (mm), volume (mm³), PI‑RADS, plus cleaned-prostate volume and LR/AP/SI dimensions.
-  - `prostate_measurements_SR.dcm` encodes prostate dimensions and volume as a DICOM TID 1500 Imaging Measurement Report using UCUM units. It references the selected T2 evidence and is explicitly UNVERIFIED.
+  - `prostate_measurements_SR.dcm` encodes prostate dimensions and volume as a DICOM TID 1500 Imaging Measurement Report using UCUM units. It references the selected T2 evidence and is explicitly UNVERIFIED. For every AI-detected lesion it also contains a TID 1500 finding (SCT "Lesion" in the prostate) with the AI PI-RADS category, the AI probability (peak 5-fold ensemble probability inside the lesion, %), the lesion volume and the major-axis length. Lesion numbering matches the combined RTSTRUCT. When a prostate is found but no lesion, it states "Lesion: Absent". This meets the CARPL DICOM Push guide's SR requirements (section 6.2).
 
 
 ## How to run

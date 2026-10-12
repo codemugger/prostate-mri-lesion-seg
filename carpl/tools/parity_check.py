@@ -163,7 +163,30 @@ def _first_difference(a, b, path: str = "") -> str:
     return "" if a == b else f"{path}: {str(a)[:80]!r} != {str(b)[:80]!r}"
 
 
-def compare_dicom(reference: Path, current: Path) -> "list[str]":
+def _canonical(value):
+    """Ignore the order of sequence items (lists of datasets) only.
+
+    Value lists such as ContourData keep their order, so contour geometry is
+    always compared point by point.
+    """
+    if isinstance(value, dict):
+        return {key: _canonical(item) for key, item in value.items()}
+    if isinstance(value, list):
+        items = [_canonical(item) for item in value]
+        if items and all(isinstance(item, dict) for item in items):
+            return sorted(items, key=lambda item: json.dumps(item, sort_keys=True))
+        return items
+    return value
+
+
+def compare_dicom(reference: Path, current: Path, notes: "list[str] | None" = None) -> "list[str]":
+    """Compare DICOM outputs after replacing run-specific UIDs and dates/times.
+
+    The SR lists its referenced T2 images in the order the copied files sort
+    by name, and file names differ between input layouts (e.g. ``1-01.dcm``
+    vs ``<SOPInstanceUID>.dcm``).  When the only difference is item order,
+    it is reported as a note, not a failure.
+    """
     problems = []
     keep = _input_uids(reference) | _input_uids(current)
     for rel in DICOM_FILES:
@@ -172,9 +195,15 @@ def compare_dicom(reference: Path, current: Path) -> "list[str]":
             if a.is_file() or b.is_file():
                 problems.append(f"{rel}: present only in {'reference' if a.is_file() else 'current'}")
             continue
-        difference = _first_difference(normalised_json(a, keep), normalised_json(b, keep))
-        if difference:
-            problems.append(f"{rel}: {difference}")
+        json_a, json_b = normalised_json(a, keep), normalised_json(b, keep)
+        difference = _first_difference(json_a, json_b)
+        if not difference:
+            continue
+        if _canonical(json_a) == _canonical(json_b):
+            if notes is not None:
+                notes.append(f"{rel}: identical content; only the order of referenced items differs")
+            continue
+        problems.append(f"{rel}: {difference}")
     return problems
 
 
@@ -198,7 +227,10 @@ def cmd_outputs(reference: Path, current: Path, scripts_dir: Path) -> int:
 
     problems += compare_nifti(reference, current)
     problems += compare_text(reference, current)
-    problems += compare_dicom(reference, current)
+    notes: "list[str]" = []
+    problems += compare_dicom(reference, current, notes)
+    for note in notes:
+        print(f"  note: {note}")
 
     import validate_rtstruct_outputs
     import compare_batch_outputs

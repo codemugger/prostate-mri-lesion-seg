@@ -9,6 +9,9 @@
 #   VERSION=1.0.0 docker compose up -d --build
 #   python tools/send_study.py ../test-data/ProstateX-0004 --port 11112
 #
+# CARPL_DATA_DIR (default ./data) relocates all runtime state; the proof
+# notebook uses it to give every run its own folder under proof_output/.
+#
 # The base inference image prostate-mri-seg:${VERSION} must already exist
 # (python scripts/build_carpl_images.py --build-base --version <v>).
 
@@ -42,7 +45,7 @@ services:
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec",
               "--maxmemory-policy", "noeviction", "--save", ""]
     volumes:
-      - ./data/redis:/data
+      - ${CARPL_DATA_DIR:-./data}/redis:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -59,7 +62,7 @@ services:
     ports:
       - "11112:11112"
     volumes:
-      - ./data:/data
+      - ${CARPL_DATA_DIR:-./data}:/data
     depends_on:
       prostate-redis:
         condition: service_healthy
@@ -80,7 +83,7 @@ services:
       <<: *env
       MODELS_DIR: /models
     volumes:
-      - ./data:/data
+      - ${CARPL_DATA_DIR:-./data}:/data
       - ${MODEL_DIR:-../models}:/models:ro
       - ./config:/config:ro
     deploy:
@@ -102,7 +105,7 @@ services:
     image: prostate-carpl-dicom-sender:${VERSION:-1.0.0}
     container_name: prostate-dev-dicom-sender
     volumes:
-      - ./data:/data
+      - ${CARPL_DATA_DIR:-./data}:/data
     depends_on:
       prostate-redis:
         condition: service_healthy
@@ -120,4 +123,4 @@ services:
       DICOM_PORT: "4242"
       STORAGE_DIR: /data/test_carpl
     volumes:
-      - ./data:/data
+      - ${CARPL_DATA_DIR:-./data}:/data

@@ -23,7 +23,7 @@ sent **byte-for-byte unmodified**:
 | File | DICOM object | Content |
 |---|---|---|
 | `combined_organ_lesion_RTSTRUCT.dcm` | RT Structure Set (Explicit VR LE) | The UroFusion-accepted canonical profile: ROI 1 `Prostate`, ROIs 2…N `Lesion N - AI PI-RADS X`, `CLOSED_PLANAR`, `UNAPPROVED` |
-| `prostate_measurements_SR.dcm` | Comprehensive SR, TID 1500 | Prostate volume and LR/AP/SI dimensions, `COMPLETE` / `UNVERIFIED` |
+| `prostate_measurements_SR.dcm` | Comprehensive SR, TID 1500 | Prostate volume and LR/AP/SI dimensions, plus one finding per AI lesion: SCT "Lesion", AI PI-RADS, AI probability (%), volume and major axis. "Lesion: Absent" when none. `COMPLETE` / `UNVERIFIED` |
 
 Both objects keep the received StudyInstanceUID and have new Series and SOP
 Instance UIDs. CARPL must match results to studies by **StudyInstanceUID**:
@@ -34,6 +34,23 @@ A study in which no prostate is detected still returns the truthful
 zero-ROI RTSTRUCT plus the SR (`SEND_EMPTY_RESULTS=true`). A study that fails
 any audit gate returns **nothing**. It is recorded in the audit log and kept
 for review, see [Failures](#failures).
+
+### SR content and CARPL guide 6.2 (Method 2: TID 1500)
+
+| CARPL requirement | How the SR meets it |
+|---|---|
+| DICOM SR, TID 1500 Measurement Report | Comprehensive SR whose content tree is TID 1500 "Imaging Measurement Report" |
+| Observer context (AI identity) | Device observer "Prostate MRI Lesion Segmentation" (UID, manufacturer, model), plus algorithm name and version in every finding |
+| Referenced study/series/SOP | Evidence sequence and image library list every selected T2 image of the received study |
+| Finding concept name | One group per lesion: `SCT 52988006 Lesion`, finding site `SCT Prostate`, tracking id "Lesion N" (same N as the RTSTRUCT ROI) |
+| Probability / confidence | `DCM 122157 Probability`, in `%`: the peak 5-fold ensemble probability inside the lesion, from the existing `merged_lesion_prob.nii.gz` |
+
+Each lesion finding also carries the AI PI-RADS category and the lesion volume and major-axis length, the same values as `lesions.txt`.
+- **Prostate found, no lesion:** one "Lesion: Absent" finding.
+- **No prostate segmented:** no lesion claim is made, because lesion inference never ran.
+- **Unchanged:** segmentation, PI-RADS classification, the RTSTRUCTs and `lesions.txt`.
+
+[`CARPL_end_to_end_proof.ipynb`](CARPL_end_to_end_proof.ipynb) checks every received SR against this table.
 
 ## Inference is unchanged
 
@@ -205,6 +222,23 @@ docker run --rm --gpus all --shm-size=1g \
 docker run --rm --entrypoint python -v "$PWD/..":/repo:ro -v "$PWD":/work:ro \
   prostate-carpl-ai-worker:1.0.0 /repo/carpl/tools/parity_check.py \
   outputs /work/direct /work/data/jobs/$JOB/output
+```
+
+### Reproducible proof notebook
+
+[`CARPL_end_to_end_proof.ipynb`](CARPL_end_to_end_proof.ipynb) runs the whole stack on ProstateX-0004 and de-identified SGH studies, in about 20-30 minutes on a GPU. It:
+- pushes each study like CARPL does;
+- shows the received contours on the original T2 images, and the SR findings;
+- checks every SR against guide 6.2;
+- proves the CARPL output is identical to a standard run of the same image on the original folder;
+- demonstrates duplicate-resend and incomplete-study safety;
+- ends with a PASS/FAIL summary.
+
+Each run writes to `carpl/proof_output/<timestamp>/`, which is git-ignored. To share the result as HTML:
+
+```bash
+jupyter nbconvert --to html --execute carpl/CARPL_end_to_end_proof.ipynb \
+  --output-dir carpl/proof_output --ExecutePreprocessor.timeout=3600
 ```
 
 ## How studies are handled

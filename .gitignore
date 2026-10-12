@@ -77,3 +77,6 @@ august_rtstruct_follow_up_for_anh
 /carpl/.env
 /carpl/.venv/
 /dist/
+
+# CARPL proof notebook runs (patient images, reports)
+/carpl/proof_output/

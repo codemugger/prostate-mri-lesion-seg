@@ -358,6 +358,7 @@ the output contract remains complete without fabricating anatomy.
 The SR is a DICOM Comprehensive SR referencing the selected T2 study. It
 contains cleaned-prostate LR/AP/SI dimensions (mm) and volume (mm³ and cm³),
 and is marked `COMPLETE`, `UNVERIFIED`, and not final pending clinical review.
+For every AI-detected lesion it also contains a TID 1500 finding (SCT "Lesion" in the prostate) with the AI PI-RADS category, the AI probability (peak 5-fold ensemble probability inside the lesion, %), the lesion volume and the major-axis length. Lesion numbering matches the combined RTSTRUCT. When a prostate is found but no lesion, it states "Lesion: Absent". This meets the CARPL DICOM Push guide's SR requirements (section 6.2).
 
 For a strict post-run RTSTRUCT guardrail check:
 

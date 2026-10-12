@@ -64,3 +64,4 @@ carpl/models/
 carpl/config/
 carpl/.env
 carpl/.venv/
+carpl/proof_output/

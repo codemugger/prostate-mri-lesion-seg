@@ -1,8 +1,23 @@
-"""DICOM Structured Report export for prostate gland measurements.
+"""DICOM Structured Report export for prostate measurements and lesion findings.
 
 The report is a DICOM Comprehensive SR containing a TID 1500 Imaging
-Measurement Report. It records measurements derived from the cleaned prostate
-mask and references the exact T2 MR series selected by the inference pipeline.
+Measurement Report. It references the exact T2 MR series selected by the
+inference pipeline and contains:
+
+* one measurement group for the cleaned prostate (dimensions and volume);
+* one group per AI-detected lesion, so the report meets the CARPL DICOM Push
+  guide (Method 2, TID 1500): a finding concept (SCT "Lesion" in the
+  prostate), a probability, the AI PI-RADS category, and the lesion volume
+  and major-axis length from ``lesions.txt``;
+* a single "Lesion: Absent" group when a prostate was segmented but no lesion
+  was detected.
+
+Lesion numbering reuses the canonical RTSTRUCT lesion mapping
+(``urofusion_rtstruct.build_lesion_rois``), so "Lesion N" in this report is
+the same lesion as the RTSTRUCT ROI "Lesion N - AI PI-RADS X". The probability
+is the peak value of the existing 5-fold ensemble map
+(``lesion/merged_lesion_prob.nii.gz``) inside that lesion, as a percentage.
+Nothing here changes segmentation, classification or the RTSTRUCT.
 
 The document is intentionally marked COMPLETE but UNVERIFIED and not FINAL:
 these are algorithm-generated research results and have not been reviewed or
@@ -128,13 +143,180 @@ def _validated_measurement(measurements: dict, key: str) -> float:
     return value
 
 
+# Pipeline outputs needed for lesion findings, relative to the case folder.
+LESION_INPUTS = (
+    "lesions.txt",
+    "lesion/lesion_mask.nii.gz",
+    "organ/cleaned_organ.nii.gz",
+)
+LESION_PROBABILITY_MAP = "lesion/merged_lesion_prob.nii.gz"
+
+
+def _lesion_findings(case_directory: Path) -> dict | None:
+    """Collect per-lesion findings from existing pipeline outputs.
+
+    Returns ``None`` when none of the lesion outputs exist (callers that only
+    report prostate measurements). Otherwise returns
+    ``{"status": "present" | "absent" | "not_assessed", "lesions": [...]}``.
+    ``not_assessed`` means no prostate was segmented, so lesion inference was
+    skipped and neither presence nor absence is reported.
+    """
+    present = [rel for rel in LESION_INPUTS if (case_directory / rel).is_file()]
+    if not present:
+        return None
+    if len(present) != len(LESION_INPUTS):
+        missing = sorted(set(LESION_INPUTS) - set(present))
+        raise FileNotFoundError(f"Incomplete lesion outputs for SR: missing {missing}")
+
+    import nibabel as nib
+    import numpy as np
+    import yaml
+    from urofusion_rtstruct import _binary_mask, _parse_lesion_scores, build_lesion_rois
+
+    organ_image = nib.load(str(case_directory / "organ/cleaned_organ.nii.gz"))
+    lesion_image = nib.load(str(case_directory / "lesion/lesion_mask.nii.gz"))
+    organ_mask = _binary_mask(organ_image)
+    lesion_mask = _binary_mask(lesion_image)
+    if not organ_mask.any():
+        return {"status": "not_assessed", "lesions": []}
+    if not lesion_mask.any():
+        return {"status": "absent", "lesions": []}
+
+    probability_path = case_directory / LESION_PROBABILITY_MAP
+    if not probability_path.is_file():
+        raise FileNotFoundError(f"Lesions present but {LESION_PROBABILITY_MAP} is missing")
+    probability = np.asanyarray(nib.load(str(probability_path)).dataobj, dtype=float)
+    if probability.ndim == 2:
+        probability = probability[:, :, np.newaxis]
+    if probability.shape != lesion_mask.shape:
+        raise ValueError(
+            f"Probability map shape {probability.shape} != lesion mask shape {lesion_mask.shape}"
+        )
+
+    lesions_txt = case_directory / "lesions.txt"
+    scores = _parse_lesion_scores(lesions_txt)
+    rows = yaml.safe_load(lesions_txt.read_text(encoding="utf-8")) or []
+    lesion_rows = {
+        int(row["Lesion_ID"]): row
+        for row in rows
+        if isinstance(row, dict) and "Lesion_ID" in row
+    }
+    # Same mapping and affine as the canonical RTSTRUCT, so lesion numbers agree.
+    rois, _mapping = build_lesion_rois(lesion_mask, organ_image.affine, scores)
+
+    lesions = []
+    for roi in rois:
+        values = probability[roi.mask]
+        peak = float(np.max(values)) * 100.0
+        if not math.isfinite(peak) or not 0.0 <= peak <= 100.0 + 1e-6:
+            raise ValueError(f"Invalid lesion probability {peak!r} for lesion {roi.display_id}")
+        row = lesion_rows.get(roi.display_id) if roi.pi_rads is not None else None
+        lesions.append(
+            {
+                "display_id": roi.display_id,
+                "pi_rads": roi.pi_rads,
+                "peak_probability_pct": round(min(peak, 100.0), 2),
+                # Same values as lesions.txt, rounded for display.
+                "volume_mm3": round(float(row["Volume"]), 2) if row else None,
+                "major_axis_mm": round(float(row["Major_Axis_Length"]), 2) if row else None,
+            }
+        )
+    return {"status": "present", "lesions": lesions}
+
+
+def _lesion_measurement_groups(
+    findings: dict,
+    algorithm_id: "hd.sr.AlgorithmIdentification",
+    source_images: list,
+) -> list:
+    """TID 1501 measurement groups for the AI lesion findings."""
+    finding_site = hd.sr.FindingSite(codes.SCT.Prostate)
+    if findings["status"] == "absent":
+        return [
+            hd.sr.MeasurementsAndQualitativeEvaluations(
+                tracking_identifier=hd.sr.TrackingIdentifier(
+                    uid=generate_uid(),
+                    identifier="AI lesion detection",
+                ),
+                finding_type=codes.SCT.Lesion,
+                algorithm_id=algorithm_id,
+                finding_sites=[finding_site],
+                qualitative_evaluations=[
+                    hd.sr.QualitativeEvaluation(
+                        name=codes.SCT.Lesion,
+                        value=codes.SCT.Absent,
+                    )
+                ],
+                source_images=source_images,
+            )
+        ]
+
+    groups = []
+    for lesion in findings["lesions"]:
+        measurements = [
+            hd.sr.Measurement(
+                name=codes.DCM.Probability,
+                value=lesion["peak_probability_pct"],
+                unit=codes.UCUM.Percent,
+                finding_sites=[finding_site],
+            )
+        ]
+        if lesion["volume_mm3"] is not None:
+            measurements.append(
+                hd.sr.Measurement(
+                    name=Code("PMLS005", PRIVATE_CODING_SCHEME, "AI lesion volume"),
+                    value=lesion["volume_mm3"],
+                    unit=codes.UCUM.CubicMillimeter,
+                    finding_sites=[finding_site],
+                )
+            )
+        if lesion["major_axis_mm"] is not None:
+            measurements.append(
+                hd.sr.Measurement(
+                    name=Code("PMLS004", PRIVATE_CODING_SCHEME, "AI lesion major axis length"),
+                    value=lesion["major_axis_mm"],
+                    unit=codes.UCUM.Millimeter,
+                    finding_sites=[finding_site],
+                )
+            )
+        if lesion["pi_rads"] is not None:
+            category = Code(
+                f"PIRADS{lesion['pi_rads']}",
+                PRIVATE_CODING_SCHEME,
+                f"PI-RADS {lesion['pi_rads']}",
+            )
+        else:
+            category = Code("PIRADSNA", PRIVATE_CODING_SCHEME, "PI-RADS unavailable")
+        groups.append(
+            hd.sr.MeasurementsAndQualitativeEvaluations(
+                tracking_identifier=hd.sr.TrackingIdentifier(
+                    uid=generate_uid(),
+                    identifier=f"Lesion {lesion['display_id']}",
+                ),
+                finding_type=codes.SCT.Lesion,
+                algorithm_id=algorithm_id,
+                finding_sites=[finding_site],
+                measurements=measurements,
+                qualitative_evaluations=[
+                    hd.sr.QualitativeEvaluation(
+                        name=Code("PMLS010", PRIVATE_CODING_SCHEME, "AI PI-RADS assessment category"),
+                        value=category,
+                    )
+                ],
+                source_images=source_images,
+            )
+        )
+    return groups
+
+
 def generate_prostate_measurement_sr(
     dicom_series_path: Path,
     output_path: Path,
     measurements: dict,
     cleanup_metrics: dict | None = None,
+    case_directory: Path | None = None,
 ) -> Path:
-    """Create a DICOM SR containing cleaned-prostate measurements.
+    """Create a DICOM SR with prostate measurements and AI lesion findings.
 
     Parameters
     ----------
@@ -148,10 +330,17 @@ def generate_prostate_measurement_sr(
     cleanup_metrics:
         Optional cleanup audit metrics. Selected values are recorded as
         algorithm parameters in the measurement group.
+    case_directory:
+        Case output folder holding ``lesions.txt`` and the lesion/organ
+        NIfTIs. Defaults to the SR's own folder, which is where the pipeline
+        writes it. If none of those outputs exist, only prostate measurements
+        are reported.
     """
     dicom_series_path = Path(dicom_series_path)
     output_path = Path(output_path)
+    case_directory = Path(case_directory) if case_directory else output_path.parent
     evidence_images = _read_reference_images(dicom_series_path)
+    lesion_findings = _lesion_findings(case_directory)
     primary_evidence = evidence_images[0]
 
     left_right_mm = _validated_measurement(measurements, "left_right_mm")
@@ -256,6 +445,25 @@ def generate_prostate_measurement_sr(
         source_images=source_images,
     )
 
+    imaging_measurements = [measurement_group]
+    if lesion_findings and lesion_findings["status"] in {"present", "absent"}:
+        imaging_measurements.extend(
+            _lesion_measurement_groups(
+                lesion_findings,
+                hd.sr.AlgorithmIdentification(
+                    name="Prostate MRI Lesion Segmentation",
+                    version="2026.07",
+                    parameters=[
+                        "5-fold 3D RR-UNet ensemble, lesion threshold 0.63",
+                        "Probability: peak ensemble voxel probability within the lesion (%)",
+                        "PI-RADS: 3D ResNet lesion classifier",
+                        "Lesion numbering matches the combined RTSTRUCT ROI names",
+                    ],
+                ),
+                source_images,
+            )
+        )
+
     observer_context = hd.sr.ObserverContext(
         observer_type=codes.DCM.Device,
         observer_identifying_attributes=(
@@ -276,7 +484,7 @@ def generate_prostate_measurement_sr(
             "SCT",
             "Multiparametric MRI of prostate",
         ),
-        imaging_measurements=[measurement_group],
+        imaging_measurements=imaging_measurements,
         title=codes.DCM.ImagingMeasurementReport,
         referenced_images=evidence_images,
     )
@@ -299,7 +507,11 @@ def generate_prostate_measurement_sr(
         is_verified=False,
     )
     document.SeriesDescription = "AI Prostate Measurements"
-    document.ContentDescription = "Cleaned prostate dimensions and volume"
+    document.ContentDescription = (
+        "Prostate measurements and AI lesion findings"
+        if lesion_findings and lesion_findings["status"] in {"present", "absent"}
+        else "Cleaned prostate dimensions and volume"
+    )
     document.ContentCreatorName = "PROSTATE^MRI^AI"
 
     private_scheme = Dataset()
